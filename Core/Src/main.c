@@ -70,6 +70,12 @@ volatile uint8_t  g_rr2_sc_error = 0;
 volatile RR2_Status g_rr2_cfg_status = RR2_OK;
 volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
 
+/* Result of the boot-time CHIP_ID sweep. Inspect these first when the
+   ASIC looks dead - they separate "wrong address" from "no bus". */
+volatile uint16_t g_rr2_chip_map    = 0;      /* bit N = id N answered */
+volatile uint8_t  g_rr2_chip_found  = RR2_CHIP_ID_NONE;
+volatile uint8_t  g_rr2_chip_active = 0;      /* id actually in use    */
+
 /* Most recent digitised event (~260 bytes, lives in .bss).         */
 RR2_Event g_rr2_event;
 volatile RR2_Status g_rr2_read_status = RR2_OK;
@@ -168,16 +174,24 @@ int main(void)
      * answered, otherwise a later 'push' from the host would write
      * zeros everywhere. */
     RR2_Ctrl_ResetShadow();
-    /* Scan all 16 possible chip IDs to find which one ACKs. */
-    volatile uint8_t found_id = 0xFF;
-    for (uint8_t id = 0; id < 16; id++) {
-        uint8_t addr = (uint8_t)(((id << 3) | 0) << 1);   /* R0 of that chip id */
-        if (HAL_I2C_IsDeviceReady(&hi2c1, addr, 3, 100) == HAL_OK) {
-            found_id = id;
-            break;
-        }
+
+    /* CHIP_ID<3:0> is strapped on the board and cannot be read from any
+     * register - the id IS part of the I2C address. So ask all 16 and
+     * point the driver at whichever one answers. Without this, a board
+     * strapped to anything other than RR2_CHIP_ID would look completely
+     * dead even though the bus is perfectly healthy.
+     *
+     * g_rr2_chip_map is the full picture, kept for the debugger:
+     *   0      nothing answered - check power, resets and pull-ups
+     *   one bit set   normal
+     *   several bits  more than one ASIC, or a foreign device on the bus
+     */
+    g_rr2_chip_found = RR2_ScanChipId((uint16_t *)&g_rr2_chip_map);
+    if (g_rr2_chip_found != RR2_CHIP_ID_NONE) {
+        RR2_SetChipId(g_rr2_chip_found);
     }
-    /* breakpoint here, read found_id */
+    g_rr2_chip_active = RR2_GetChipId();
+
     g_rr2_online = RR2_Bringup();
 
     if (g_rr2_online) {

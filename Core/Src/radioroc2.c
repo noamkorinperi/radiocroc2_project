@@ -13,6 +13,10 @@
 
 static I2C_HandleTypeDef *rr2_i2c = NULL;
 
+/* The chip id every transaction is addressed to. Starts at the
+   compile-time default and is overridden once the board is scanned. */
+static uint8_t rr2_chip_id = (uint8_t)RR2_CHIP_ID;
+
 /* ------------------------------------------------------------------ */
 /* Low-level: one byte to / from a given internal register            */
 /* ------------------------------------------------------------------ */
@@ -36,6 +40,45 @@ static HAL_StatusTypeDef rr2_reg_read(uint8_t reg, uint8_t *value)
 void RR2_Init(I2C_HandleTypeDef *hi2c)
 {
     rr2_i2c = hi2c;
+}
+
+void RR2_SetChipId(uint8_t id)
+{
+    rr2_chip_id = (uint8_t)(id & 0x0Fu);
+}
+
+uint8_t RR2_GetChipId(void)
+{
+    return rr2_chip_id;
+}
+
+uint8_t RR2_ScanChipId(uint16_t *map)
+{
+    uint16_t hits  = 0u;
+    uint8_t  first = RR2_CHIP_ID_NONE;
+
+    if (rr2_i2c == NULL) {
+        if (map != NULL) *map = 0u;
+        return RR2_CHIP_ID_NONE;
+    }
+
+    for (uint8_t id = 0u; id < 16u; ++id) {
+        /* Demand an ACK on two different internal registers before
+           believing a hit - one stray address is easy to collide with,
+           two consecutive ones much less so. */
+        const uint8_t a0 = RR2_HAL_ADDR_OF(id, RR2_REG_ADDR_LSB);
+        const uint8_t a1 = RR2_HAL_ADDR_OF(id, RR2_REG_ADDR_MSB);
+
+        if ((HAL_I2C_IsDeviceReady(rr2_i2c, a0, 2u, RR2_I2C_TIMEOUT) == HAL_OK) &&
+            (HAL_I2C_IsDeviceReady(rr2_i2c, a1, 2u, RR2_I2C_TIMEOUT) == HAL_OK)) {
+
+            hits |= (uint16_t)(1u << id);
+            if (first == RR2_CHIP_ID_NONE) first = id;
+        }
+    }
+
+    if (map != NULL) *map = hits;
+    return first;
 }
 
 HAL_StatusTypeDef RR2_IsReady(uint32_t trials)

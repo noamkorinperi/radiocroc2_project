@@ -30,10 +30,18 @@
 /* Chip identity                                                       */
 /* ------------------------------------------------------------------ */
 /* CHIP_ID<3:0> is hard-strapped on the test board. Datasheet default  */
-/* is 0b0001. VERIFY the strapping on YOUR board and change if needed. */
+/* is 0b0001, but the strapping is a board decision and there is no    */
+/* register to read it back from - the ID *is* part of the address, so */
+/* the only way to learn it is to ask all 16 and see which one ACKs.   */
+/* RR2_ScanChipId() does exactly that; RR2_SetChipId() then points the */
+/* driver at whatever was found. This constant is only the starting    */
+/* value, used until something overrides it.                           */
 #ifndef RR2_CHIP_ID
 #define RR2_CHIP_ID            0x1u
 #endif
+
+/* Returned by RR2_ScanChipId() when nothing on the bus answered. */
+#define RR2_CHIP_ID_NONE       0xFFu
 
 /* ------------------------------------------------------------------ */
 /* Internal I2C slave-core registers (Table 3)                         */
@@ -45,9 +53,13 @@
 #define RR2_REG_DATA_AINC      3u   /* R3: data + auto-increment subadd   */
 #define RR2_REG_STATUS         7u   /* R7: status (error, parity)         */
 
-/* 8-bit HAL device address for a given internal register.             */
-/* Wire byte = [CHIP_ID(4)][reg(3)][R/W(1)].                           */
-#define RR2_HAL_ADDR(reg)  ((uint8_t)((((RR2_CHIP_ID << 3) | ((reg) & 0x7u)) << 1)))
+/* 8-bit HAL device address for an internal register of an EXPLICIT    */
+/* chip id. Wire byte = [CHIP_ID(4)][reg(3)][R/W(1)].                  */
+#define RR2_HAL_ADDR_OF(id, reg) \
+    ((uint8_t)(((((uint8_t)(id) & 0x0Fu) << 3) | ((reg) & 0x7u)) << 1))
+
+/* Same, for whichever chip id the driver is currently pointed at.     */
+#define RR2_HAL_ADDR(reg)  RR2_HAL_ADDR_OF(RR2_GetChipId(), (reg))
 
 /* ------------------------------------------------------------------ */
 /* Common ASIC "address" values (R1 field)                             */
@@ -77,6 +89,32 @@ typedef enum {
 
 /** Bind the driver to an I2C handle. Call once, after MX_I2C1_Init(). */
 void RR2_Init(I2C_HandleTypeDef *hi2c);
+
+/** Point the driver at a chip id. Every later transaction uses it.    */
+void RR2_SetChipId(uint8_t id);
+
+/** The chip id currently in use (RR2_CHIP_ID until something set it). */
+uint8_t RR2_GetChipId(void);
+
+/**
+ * @brief Probe all 16 possible chip ids and report which ones answer.
+ *
+ * Each candidate is probed on TWO of its internal registers (R0 and R1)
+ * and only counts as a hit if both ACK. A foreign device sharing the
+ * bus would have to occupy two specific consecutive addresses to fool
+ * this, which is far less likely than a single-address collision.
+ *
+ * Does NOT change the active chip id - call RR2_SetChipId() with the
+ * result if you want to use it.
+ *
+ * @param  map  optional bitmap out, bit N set = chip id N answered
+ * @retval lowest chip id that answered, or RR2_CHIP_ID_NONE if none did
+ *
+ * @note Chip id 0 lands on I2C addresses 0x00..0x07, which the I2C spec
+ *       reserves (0x00 is the general call address). A hit there is
+ *       suspect; the bitmap reports it, but treat it with care.
+ */
+uint8_t RR2_ScanChipId(uint16_t *map);
 
 /** Stage-1 bring-up: does the ASIC ACK on its Chip ID? (HAL_OK = yes) */
 HAL_StatusTypeDef RR2_IsReady(uint32_t trials);
