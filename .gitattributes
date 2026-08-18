@@ -1,0 +1,28 @@
+# Normalise line endings in the repo so a checkout on Windows and one on
+# Linux produce identical diffs. Without this, git rewrites CRLF on every
+# touch and unrelated files show up as changed.
+* text=auto
+
+# Sources and project files: always LF inside the repo.
+*.c      text eol=lf
+*.h      text eol=lf
+*.s      text eol=lf
+*.ld     text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.ioc    text eol=lf
+*.xml    text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# Eclipse / CubeIDE project metadata.
+.project   text eol=lf
+.cproject  text eol=lf
+.mxproject text eol=lf
+*.launch   text eol=lf
+
+# Anything binary that may show up later.
+*.elf  binary
+*.bin  binary
+*.hex  binary
+*.xlsx binary

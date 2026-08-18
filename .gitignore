@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------
+# STM32CubeIDE build output. Fully regenerated from the sources and
+# the .cproject, and about 55 MB - never commit it.
+# ---------------------------------------------------------------
+/Debug/
+/Release/
+
+# CubeMX writes this before regenerating code; not part of the project.
+*.ioc.bak
+*.bak
+
+# ---------------------------------------------------------------
+# Python host tools
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Captures and exports produced by rr2_decode.py / rr2_gui.py
+*.csv
+*.xlsx
+*.bin
+
+# ---------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
