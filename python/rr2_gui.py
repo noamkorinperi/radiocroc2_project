@@ -35,7 +35,7 @@ from tkinter import filedialog, messagebox, ttk
 
 # ---------------------------------------------------------------- protocol
 try:
-    from rr2_decode import Decoder
+    from rr2_decode import Decoder, LINK_BAUD, find_link_port
 except ImportError:
     sys.exit("rr2_decode.py must be in the same folder as rr2_gui.py")
 
@@ -90,15 +90,23 @@ class Link:
     # ---- connection -------------------------------------------------
     @staticmethod
     def ports():
+        """Available ports, ST-Link first so it lands under the cursor."""
         if not HAVE_SERIAL:
             return []
-        return [p.device for p in list_ports.comports()]
+        devs = [p.device for p in list_ports.comports()]
+        link = find_link_port()
+        if link and link in devs:            # float it to the top
+            devs.remove(link)
+            devs.insert(0, link)
+        return devs
 
     def open(self, port):
         self.close()
         if not HAVE_SERIAL:
             raise RuntimeError("pyserial is not installed")
-        self.ser = serial.Serial(port, 115200, timeout=0.05)
+        # A real UART now, not a CDC endpoint - the baud rate matters and
+        # has to match RR2_LINK_BAUD in the firmware or every byte is junk.
+        self.ser = serial.Serial(port, LINK_BAUD, timeout=0.05)
         self.sim = False
         self._start_reader(self._read_serial)
 
@@ -645,9 +653,15 @@ class PageMain(Page):
         return f
 
     def refresh_ports(self):
-        ports = Link.ports()
+        ports = Link.ports()          # ST-Link first, see Link.ports()
         self.cmb["values"] = ports
-        if ports and not self.cmb.get():
+        # Prefer the ST-Link even if something else is already selected -
+        # its COM number moves around between USB sockets, so a stale
+        # selection is more likely wrong than deliberate.
+        link = find_link_port()
+        if link and link in ports:
+            self.cmb.set(link)
+        elif ports and not self.cmb.get():
             self.cmb.set(ports[0])
 
     def connect(self):

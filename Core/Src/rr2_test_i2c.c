@@ -209,7 +209,7 @@ void RR2_TestI2C_Task(void)
 
     /* The ASIC's I2C slave core is clocked by CLK_SM_I2C. Without it the
        chip cannot answer, and the whole test would report a dead bus for
-       the wrong reason. Make sure PE9 is running before touching SCL. */
+       the wrong reason. Make sure PA8 is running before touching SCL. */
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
     g_test_i2c_ok   = 0u;

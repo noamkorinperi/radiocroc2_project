@@ -38,6 +38,57 @@ import struct
 import sys
 
 SYNC = b"\xA5\x5A"
+
+# The board streams over USART3, which is wired to the ST-Link's Virtual
+# COM Port - one USB cable carries both the debugger and the data. Unlike
+# the old USB CDC link, this is a real UART, so the baud rate is no longer
+# cosmetic: get it wrong and you get garbage, not silence.
+#
+# Must match RR2_LINK_BAUD in Core/Inc/usart.h.
+LINK_BAUD = 921600
+
+# ST-Link composite device. 0x374B is the V2-1 fitted to a NUCLEO-F722ZE;
+# the others are STLINK-V3 variants, listed so the same script works on a
+# "-Q" board without edits.
+STLINK_VID = 0x0483
+STLINK_PIDS = (0x374B, 0x374E, 0x374F, 0x3753, 0x3754)
+
+
+def _comports():
+    """pyserial's port list, or None if pyserial is not installed.
+
+    None and [] mean different things - "you need to pip install
+    something" versus "plug the board in" - and the callers say so.
+    """
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return None
+    return list(list_ports.comports())
+
+
+def _is_stlink(p):
+    return p.vid == STLINK_VID and p.pid in STLINK_PIDS
+
+
+def find_link_port():
+    """Device name of the ST-Link VCP, or None if it is not there.
+
+    Saves hunting through Device Manager for the COM number, which
+    changes whenever the board lands on a different USB socket.
+    """
+    for p in _comports() or ():
+        if _is_stlink(p):
+            return p.device
+    return None
+
+
+def describe_ports():
+    """[(device, description, is_stlink)], or None if pyserial is absent."""
+    ports = _comports()
+    if ports is None:
+        return None
+    return [(p.device, p.description or "?", _is_stlink(p)) for p in ports]
 FRAME_EVENT = 1
 FRAME_STATUS = 2
 
@@ -153,16 +204,39 @@ class Decoder:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Decode the RADIOROC2 USB stream.")
-    ap.add_argument("port", nargs="?", help="serial port, e.g. /dev/ttyACM0 or COM5")
+    ap = argparse.ArgumentParser(
+        description="Decode the RADIOROC2 stream from the ST-Link VCP.")
+    ap.add_argument("port", nargs="?",
+                    help="serial port, e.g. COM3 or /dev/ttyACM0. "
+                         "Omit it and the ST-Link is found automatically.")
     ap.add_argument("--file", help="read from a binary capture instead of a port")
     ap.add_argument("--csv", help="write decoded events to this CSV file")
-    ap.add_argument("--baud", type=int, default=115200,
-                    help="ignored by CDC, kept for pyserial compatibility")
+    ap.add_argument("--baud", type=int, default=LINK_BAUD,
+                    help=f"link speed, default {LINK_BAUD} "
+                         f"(must match RR2_LINK_BAUD in usart.h)")
+    ap.add_argument("--list", action="store_true",
+                    help="list serial ports and exit")
     args = ap.parse_args()
 
+    if args.list:
+        ports = describe_ports()
+        if ports is None:
+            print("pyserial is not installed:  pip install pyserial")
+        elif not ports:
+            print("no serial ports found - is the board plugged in?")
+        else:
+            for dev, desc, is_link in ports:
+                print(f"  {dev:<10} {desc}" + ("   <- ST-Link" if is_link else ""))
+        return
+
     if not args.port and not args.file:
-        ap.error("give a serial port or --file")
+        if _comports() is None:
+            ap.error("pyserial is not installed:  pip install pyserial")
+        args.port = find_link_port()
+        if not args.port:
+            ap.error("no ST-Link found - name a port, or use --file. "
+                     "Run with --list to see what is connected.")
+        print(f"auto-detected ST-Link on {args.port}")
 
     dec = Decoder()
     writer = None
@@ -210,7 +284,8 @@ def main():
                 sys.exit("pyserial is required for live capture:  pip install pyserial")
 
             with serial.Serial(args.port, args.baud, timeout=0.1) as ser:
-                print(f"listening on {args.port} - Ctrl-C to stop")
+                print(f"listening on {args.port} at {args.baud} baud"
+                      f" - Ctrl-C to stop")
                 while True:
                     chunk = ser.read(4096)
                     if chunk:

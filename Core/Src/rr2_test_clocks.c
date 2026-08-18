@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    rr2_test_clocks.c
- * @brief   Scope test 1 of 2 - CLK_SM_I2C (PE9) and CK_READ (PA1) timing.
+ * @brief   Scope test 1 of 2 - CLK_SM_I2C (PA8) and CK_READ (PA1) timing.
  * @note    See rr2_test_clocks.h for the probe setup and the variable list.
  ******************************************************************************
  */
@@ -140,7 +140,7 @@ void RR2_TestClocks_Task(void)
 {
     if (!g_test_clk_mode) return;
 
-    /* PE9 carries the 2 MHz reference. It is started during boot, but
+    /* PA8 carries the 2 MHz reference. It is started during boot, but
        start it again in case the test is entered after something else
        stopped it - HAL is happy to be told twice.                     */
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
