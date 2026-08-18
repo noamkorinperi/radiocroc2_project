@@ -43,7 +43,21 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* ---------------------------------------------------------------
+ * Which ASIC inputs actually carry a detector.
+ *
+ * The sensors are modular rather than soldered, so this is the one
+ * place to edit when the arrangement changes - and it can also be
+ * changed at runtime without reflashing, with "sel 3 9 20 41 55"
+ * over the command link.
+ *
+ * The list does NOT have to be contiguous. Unselected channels are
+ * clocked past without being digitised, and are disabled in the ASIC
+ * so they cannot fire the trigger on their own noise.
+ *
+ * Leave it empty to start with all 64 enabled.
+ * ------------------------------------------------------------- */
+static const uint8_t RR2_DETECTOR_CHANNELS[] = { 0, 1, 2, 3, 4 };
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -75,6 +89,10 @@ volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
 volatile uint16_t g_rr2_chip_map    = 0;      /* bit N = id N answered */
 volatile uint8_t  g_rr2_chip_found  = RR2_CHIP_ID_NONE;
 volatile uint8_t  g_rr2_chip_active = 0;      /* id actually in use    */
+
+/* Channels carrying a detector. Mirrors the DAQ mask, exposed here so
+   it shows up next to the rest of the state in the debugger. */
+volatile uint64_t g_rr2_channel_mask = 0;
 
 /* Most recent digitised event (~260 bytes, lives in .bss).         */
 RR2_Event g_rr2_event;
@@ -194,9 +212,25 @@ int main(void)
 
     g_rr2_online = RR2_Bringup();
 
-    if (g_rr2_online) {
-        g_rr2_cfg_status = RR2_Ctrl_PushAll();
+    /* Tell the readout which inputs to digitise. Done before PushAll so
+     * the enable bits it writes already reflect the selection, instead
+     * of enabling all 64 and switching most off again a moment later. */
+    if (sizeof(RR2_DETECTOR_CHANNELS) > 0u) {
+        (void)RR2_DAQ_SelectChannels(RR2_DETECTOR_CHANNELS,
+                                     (uint8_t)sizeof(RR2_DETECTOR_CHANNELS));
+    }
+    g_rr2_channel_mask = RR2_DAQ_GetChannelMask();
 
+    if (g_rr2_online) {
+        /* Only the selected channels stay powered. An enabled channel
+         * feeds the NOR trigger whether or not a detector hangs off it,
+         * so leaving the empty ones on would trigger the DAQ on their
+         * own noise. */
+        g_rr2_cfg_status = RR2_Ctrl_ApplyChannelMask(g_rr2_channel_mask);
+
+        if (g_rr2_cfg_status == RR2_OK) {
+            g_rr2_cfg_status = RR2_Ctrl_PushAll();
+        }
         if (g_rr2_cfg_status == RR2_OK) {
             g_rr2_cfg_status = RR2_Ctrl_SetThresholds(300u, 500u, 200u);
         }
@@ -370,12 +404,13 @@ static uint8_t RR2_Bringup(void)
  * @brief Digitise one event after a trigger.
  *
  * The ASIC's delay cell has to finish asserting "hold" before the read
- * register may be clocked, so wait that out first. A full 64-channel
- * readout takes roughly 64 x 6 us = 400 us, dominated by the ADC.
+ * register may be clocked, so wait that out first.
  *
- * If only a few channels are instrumented, replace RR2_DAQ_ReadEvent
- * with RR2_DAQ_ReadWindow(&g_rr2_event, first_ch, count) - it fast
- * forwards past the unused channels and is far quicker.
+ * How long this takes depends on the channel selection, because the
+ * ADC dominates: all 64 channels costs roughly 64 x 6 us = 400 us,
+ * while five selected channels costs about 50 us - the clocking still
+ * walks the read register, but only five pairs of conversions happen.
+ * See RR2_DETECTOR_CHANNELS above and the "sel" command.
  */
 static void RR2_ServiceEvent(void)
 {
@@ -428,6 +463,7 @@ static void USB_SendStatusPeriodic(void)
     if (HAL_GetTick() < s_status_next_ms) return;
     s_status_next_ms = HAL_GetTick() + 1000u;
 
+    st.channel_mask   = g_rr2_channel_mask;
     st.uptime_ms      = HAL_GetTick();
     st.trigger_count  = g_rr2_trigger_count;
     st.events_ok      = g_rr2_events_ok;

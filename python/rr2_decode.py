@@ -21,10 +21,15 @@ Event payload:
     0   4   sequence number
     4   4   timestamp, ms since boot
     8   4   temperature, milli-Celsius (signed)
-    12  1   first channel
-    13  1   channel count
-    14  2*count  high-gain codes
-    ..  2*count  low-gain codes
+    12  8   channel mask, bit N = channel N present
+    20  2*n  high-gain codes, ascending channel order
+    ..  2*n  low-gain codes
+where n = popcount(mask).
+
+The mask rides in every frame instead of being announced once, so each
+frame stands alone: a dropped frame never desynchronises the ones after
+it. The selection is not assumed contiguous - the detectors are modular
+and any subset of the 64 inputs can be populated.
 """
 
 import argparse
@@ -101,8 +106,13 @@ class Decoder:
     @staticmethod
     def _parse(ftype: int, p: bytes):
         if ftype == FRAME_EVENT:
-            seq, ts, temp, first, count = struct.unpack_from("<IIiBB", p, 0)
-            off = 14
+            seq, ts, temp, mask = struct.unpack_from("<IIiQ", p, 0)
+            # The mask says which of the 64 inputs are in this frame. It
+            # is not assumed contiguous - the detectors are modular, so
+            # any subset can be populated.
+            channels = [c for c in range(64) if mask >> c & 1]
+            count = len(channels)
+            off = 20
             hg = list(struct.unpack_from(f"<{count}H", p, off))
             off += 2 * count
             lg = list(struct.unpack_from(f"<{count}H", p, off))
@@ -111,17 +121,21 @@ class Decoder:
                 "seq": seq,
                 "t_ms": ts,
                 "temp_c": temp / 1000.0,
-                "first_ch": first,
+                "mask": mask,
+                "channels": channels,   # channels[i] owns hg[i] / lg[i]
+                "first_ch": channels[0] if channels else 0,
                 "count": count,
                 "hg": hg,
                 "lg": lg,
             }
 
         if ftype == FRAME_STATUS:
-            (uptime, trig, ok, bad, drop, temp,
-             flags, cfg_st, rd_st) = struct.unpack_from("<IIIIIiBBB", p, 0)
+            (mask, uptime, trig, ok, bad, drop, temp,
+             flags, cfg_st, rd_st) = struct.unpack_from("<QIIIIIiBBB", p, 0)
             return {
                 "type": "status",
+                "mask": mask,
+                "channels": [c for c in range(64) if mask >> c & 1],
                 "uptime_ms": uptime,
                 "triggers": trig,
                 "events_ok": ok,
@@ -162,14 +176,16 @@ def main():
     def handle(frame):
         if frame["type"] == "event":
             peak = max(frame["hg"]) if frame["hg"] else 0
+            chans = ",".join(str(c) for c in frame["channels"])
             print(f"EVT seq={frame['seq']:<6} t={frame['t_ms']/1000:8.3f}s "
-                  f"T={frame['temp_c']:6.2f}C ch={frame['first_ch']}+{frame['count']} "
+                  f"T={frame['temp_c']:6.2f}C ch=[{chans}] "
                   f"maxHG={peak}")
             if writer:
-                for i in range(frame["count"]):
+                # channels[i] owns hg[i] / lg[i]; the selection may be
+                # sparse, so never reconstruct it by counting up.
+                for i, ch in enumerate(frame["channels"]):
                     writer.writerow([frame["seq"], frame["t_ms"], frame["temp_c"],
-                                     frame["first_ch"] + i,
-                                     frame["hg"][i], frame["lg"][i]])
+                                     ch, frame["hg"][i], frame["lg"][i]])
         elif frame["type"] == "status":
             print(f"STA up={frame['uptime_ms']/1000:.1f}s trig={frame['triggers']} "
                   f"ok={frame['events_ok']} bad={frame['events_bad']} "

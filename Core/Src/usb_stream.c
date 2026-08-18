@@ -89,6 +89,12 @@ static void put_u32_crc(uint32_t v)
     put_crc((uint8_t)((v >> 24) & 0xFFu));
 }
 
+static void put_u64_crc(uint64_t v)
+{
+    put_u32_crc((uint32_t)(v & 0xFFFFFFFFu));
+    put_u32_crc((uint32_t)(v >> 32));
+}
+
 /** Emit sync + type + length and start the CRC over type/length. */
 static void put_header(uint8_t type, uint16_t payload_len)
 {
@@ -173,24 +179,26 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
 {
     if (evt == NULL) return 0u;
 
-    const uint8_t  first = evt->first_ch;
-    const uint8_t  count = evt->count;
+    const uint64_t mask  = evt->mask;
+    const uint8_t  count = (uint8_t)__builtin_popcountll(mask);
 
     if (tx_format == USBSTREAM_FMT_TEXT) {
-        /* E,seq,ms,tempmC,first,count,hg,lg,hg,lg,...  */
+        /* E,seq,ms,tempmC,ch,hg,lg,ch,hg,lg,...
+           Channel numbers are spelled out per triplet here rather than
+           sent as a mask - text output exists to be read by a human on
+           a terminal, and a 16-digit hex mask is not that. */
         if (!text_push("E,"))                    { frames_dropped++; return 0u; }
         if (!text_push_i32((int32_t)evt->seq))   { frames_dropped++; return 0u; }
         if (!text_push(","))                     { frames_dropped++; return 0u; }
         if (!text_push_i32((int32_t)timestamp_ms)) { frames_dropped++; return 0u; }
         if (!text_push(","))                     { frames_dropped++; return 0u; }
         if (!text_push_i32(temp_milli_c))        { frames_dropped++; return 0u; }
-        if (!text_push(","))                     { frames_dropped++; return 0u; }
-        if (!text_push_i32((int32_t)first))      { frames_dropped++; return 0u; }
-        if (!text_push(","))                     { frames_dropped++; return 0u; }
-        if (!text_push_i32((int32_t)count))      { frames_dropped++; return 0u; }
 
-        for (uint8_t i = 0u; i < count; ++i) {
-            const uint8_t ch = (uint8_t)(first + i);
+        for (uint8_t ch = 0u; ch < RR2_NUM_CHANNELS; ++ch) {
+            if ((mask & ((uint64_t)1u << ch)) == 0u) continue;
+
+            if (!text_push(","))                          { frames_dropped++; return 0u; }
+            if (!text_push_i32((int32_t)ch))              { frames_dropped++; return 0u; }
             if (!text_push(","))                          { frames_dropped++; return 0u; }
             if (!text_push_i32((int32_t)evt->hg[ch]))     { frames_dropped++; return 0u; }
             if (!text_push(","))                          { frames_dropped++; return 0u; }
@@ -201,7 +209,7 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     }
 
     /* ---- Binary ---- */
-    const uint16_t payload_len = (uint16_t)(14u + (4u * (uint32_t)count));
+    const uint16_t payload_len = (uint16_t)(20u + (4u * (uint32_t)count));
     const uint32_t need        = 2u + 1u + 2u + payload_len + 2u;
 
     if (ring_free() < need) {
@@ -213,13 +221,15 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     put_u32_crc(evt->seq);
     put_u32_crc(timestamp_ms);
     put_u32_crc((uint32_t)temp_milli_c);
-    put_crc(first);
-    put_crc(count);
-    for (uint8_t i = 0u; i < count; ++i) {
-        put_u16_crc(evt->hg[(uint8_t)(first + i)]);
+    put_u64_crc(mask);
+
+    /* Both gains go out in ascending channel order, so the host can
+       pair code i with the i-th set bit of the mask. */
+    for (uint8_t ch = 0u; ch < RR2_NUM_CHANNELS; ++ch) {
+        if (mask & ((uint64_t)1u << ch)) put_u16_crc(evt->hg[ch]);
     }
-    for (uint8_t i = 0u; i < count; ++i) {
-        put_u16_crc(evt->lg[(uint8_t)(first + i)]);
+    for (uint8_t ch = 0u; ch < RR2_NUM_CHANNELS; ++ch) {
+        if (mask & ((uint64_t)1u << ch)) put_u16_crc(evt->lg[ch]);
     }
     put_footer();
     return 1u;
@@ -250,7 +260,7 @@ uint8_t USBStream_SendStatus(const USBStream_Status *st)
         return 1u;
     }
 
-    const uint16_t payload_len = 27u;
+    const uint16_t payload_len = 35u;
     const uint32_t need        = 2u + 1u + 2u + payload_len + 2u;
 
     if (ring_free() < need) {
@@ -259,6 +269,7 @@ uint8_t USBStream_SendStatus(const USBStream_Status *st)
     }
 
     put_header((uint8_t)USBSTREAM_FRAME_STATUS, payload_len);
+    put_u64_crc(st->channel_mask);
     put_u32_crc(st->uptime_ms);
     put_u32_crc(st->trigger_count);
     put_u32_crc(st->events_ok);

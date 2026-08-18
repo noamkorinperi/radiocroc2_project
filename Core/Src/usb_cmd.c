@@ -85,6 +85,7 @@ static void cmd_help(void)
 {
     reply("commands:\r\n");
     reply("  stat | fmt bin|txt | defaults | push\r\n");
+    reply("  sel <ch> [ch ...] | sel all | sel   (detector channels)\r\n");
     reply("  ch <n|all> indac <0-255>\r\n");
     reply("  ch <n|all> gain <lg> <hg>      (0-15)\r\n");
     reply("  ch <n|all> tau <lg> <hg>       (0-15)\r\n");
@@ -170,12 +171,71 @@ static void cmd_ch(void)
     }
 }
 
+/**
+ * @brief "sel 3 9 20 41 55"  - pick the channels that carry a detector.
+ *        "sel all"           - back to all 64.
+ *        "sel"               - just report the current selection.
+ *
+ * Applies to BOTH sides: the readout stops digitising the others, and
+ * the ASIC stops them triggering. The sensors are modular, so this is
+ * expected to change between runs and lives here rather than in a
+ * #define.
+ */
+static void cmd_sel(void)
+{
+    RR2_Status st;
+
+    if (ntok >= 2u) {
+        if (arg_is(1u, "all")) {
+            RR2_DAQ_SetChannelMask(RR2_MASK_ALL);
+        } else {
+            uint8_t list[8];
+            uint8_t n = 0u;
+
+            for (uint8_t i = 1u; (i < ntok) && (n < (uint8_t)sizeof(list)); ++i) {
+                const int32_t v = arg_i(i, -1);
+                if ((v < 0) || (v >= (int32_t)RR2_NUM_CHANNELS)) {
+                    reply("ERR: channels must be 0-63\r\n");
+                    return;
+                }
+                list[n++] = (uint8_t)v;
+            }
+
+            st = RR2_DAQ_SelectChannels(list, n);
+            if (st != RR2_OK) {
+                reply("ERR: bad channel list\r\n");
+                return;
+            }
+        }
+
+        /* Keep the ASIC in step, otherwise the deselected channels keep
+           firing the NOR trigger on their own noise. ~70 ms. */
+        st = RR2_Ctrl_ApplyChannelMask(RR2_DAQ_GetChannelMask());
+        if (st != RR2_OK) {
+            reply("ERR: selection set, but the ASIC refused the enables\r\n");
+            return;
+        }
+    }
+
+    /* Always echo what is now in force, so "sel" alone is a query. */
+    const uint64_t m = RR2_DAQ_GetChannelMask();
+    char b[64];
+    (void)snprintf(b, sizeof(b), "sel=%08lX%08lX n=%u\r\n",
+                   (unsigned long)(uint32_t)(m >> 32),
+                   (unsigned long)(uint32_t)(m & 0xFFFFFFFFu),
+                   (unsigned)RR2_DAQ_GetChannelCount());
+    reply(b);
+}
+
 static void execute(void)
 {
     if (ntok == 0u) return;
 
     if (arg_is(0u, "help")) {
         cmd_help();
+    }
+    else if (arg_is(0u, "sel")) {
+        cmd_sel();
     }
     else if (arg_is(0u, "stat")) {
         reply_kv("pending", (int32_t)USBStream_GetPending());

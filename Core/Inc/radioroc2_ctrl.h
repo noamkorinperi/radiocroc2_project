@@ -111,6 +111,23 @@ RR2_Status RR2_Ctrl_SetChannelEnabled(uint8_t ch, uint8_t enable);
  *  radiation source. use_ctest selects the 1.5 pF test capacitor.    */
 RR2_Status RR2_Ctrl_SetChargeInjection(uint8_t ch, uint8_t enable, uint8_t use_ctest);
 
+/**
+ * @brief Enable exactly the channels in @p mask and disable the rest.
+ *
+ * The analog counterpart to RR2_DAQ_SetChannelMask(). Skipping a
+ * channel in the readout stops it being digitised, but it does NOT
+ * stop it firing: an enabled channel keeps feeding the NOR trigger
+ * whether or not a detector is attached, so 59 empty inputs would
+ * trigger the DAQ on their own noise.
+ *
+ * Pass the same mask to both, at start-up and whenever the detector
+ * arrangement changes.
+ *
+ * @note Costs two Slow Control writes per channel, about 70 ms for all
+ *       64. Fine at boot, too slow to call per event.
+ */
+RR2_Status RR2_Ctrl_ApplyChannelMask(uint64_t mask);
+
 /* ------------------------------------------------------------------ */
 /* Global setters (address 64 / 65 / 66)                               */
 /* ------------------------------------------------------------------ */

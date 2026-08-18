@@ -41,13 +41,33 @@
 #define RR2_HOLD_DELAY_NS      3000u
 
 /* ------------------------------------------------------------------ */
+/* Channel selection                                                   */
+/* ------------------------------------------------------------------ */
+/* Which of the 64 inputs actually carry a detector. Bit N = channel N.
+ *
+ * The sensors are modular rather than soldered down, so which inputs
+ * are populated changes between setups and the selection has to be a
+ * runtime value, not a compile-time one. It is also NOT assumed to be
+ * contiguous: the readout clocks past unselected channels without
+ * sampling them, which costs a couple of hundred nanoseconds each
+ * instead of the ~6 us an ADC conversion takes.
+ *
+ * Default is all 64, so out of the box the firmware behaves exactly as
+ * it did before any selection is made.                                */
+#define RR2_MASK_ALL      (~(uint64_t)0)
+#define RR2_MASK_NONE     ((uint64_t)0)
+#define RR2_MASK_CH(n)    ((uint64_t)1u << (n))
+
+/* ------------------------------------------------------------------ */
 /* One captured event                                                  */
 /* ------------------------------------------------------------------ */
 typedef struct {
+    /* Indexed by ABSOLUTE channel number, so hg[7] is always channel 7
+       whatever the mask happens to be. Only the channels set in mask
+       hold meaningful data; the rest keep whatever they had.          */
     uint16_t hg[RR2_NUM_CHANNELS];  /* High Gain peak, ADC1_IN4 counts */
     uint16_t lg[RR2_NUM_CHANNELS];  /* Low  Gain peak, ADC2_IN5 counts */
-    uint8_t  first_ch;              /* first channel stored in hg/lg   */
-    uint8_t  count;                 /* how many channels are valid     */
+    uint64_t mask;                  /* which channels are valid        */
     uint32_t seq;                   /* trigger sequence number         */
 } RR2_Event;
 
@@ -78,13 +98,47 @@ void RR2_DAQ_EndOfReadout(void);
 /** Emit one CK_READ pulse, advancing the read register by one channel. */
 void RR2_DAQ_ClockOnce(void);
 
-/** Full readout: reset pointer, digitise all 64 channels, reset ASIC. */
-RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt);
+/* ------------------------------------------------------------------ */
+/* Channel selection                                                   */
+/* ------------------------------------------------------------------ */
 
-/** Partial readout. Channels before @p first_ch are fast-forwarded
- *  without settling or sampling, which is much quicker when only a
- *  known sub-range is instrumented (Example 1 "fast forward").        */
-RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count);
+/** Choose which channels to digitise. Takes effect on the next event. */
+void RR2_DAQ_SetChannelMask(uint64_t mask);
+
+/** The mask currently in force. */
+uint64_t RR2_DAQ_GetChannelMask(void);
+
+/** How many channels the current mask selects. */
+uint8_t RR2_DAQ_GetChannelCount(void);
+
+/**
+ * @brief Build a mask from an explicit list of channel numbers.
+ *
+ * The readable way to say "my five detectors are on 3, 9, 20, 41, 55":
+ *
+ *      static const uint8_t mine[] = { 3, 9, 20, 41, 55 };
+ *      RR2_DAQ_SelectChannels(mine, 5);
+ *
+ * @retval RR2_OK, or RR2_ERR_DATA if any entry is >= RR2_NUM_CHANNELS.
+ *         On error the current mask is left untouched.
+ */
+RR2_Status RR2_DAQ_SelectChannels(const uint8_t *list, uint8_t n);
+
+/* ------------------------------------------------------------------ */
+/* Readout                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Digitise one event, sampling only the channels in the mask.
+ *
+ * Walks the read register from channel 0 up to the highest selected
+ * channel, clocking past the ones that are not selected and stopping
+ * as soon as the last selected one has been read. With five scattered
+ * detectors that is 64 clock pulses but only five pairs of ADC
+ * conversions - roughly 50 us instead of the 400-500 us a full sweep
+ * costs, because the conversions dominate, not the clocking.
+ */
+RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt);
 
 /** Sample both gains once, without touching CK_READ. Useful to probe
  *  a single channel or to check the analog path during bring-up.      */
