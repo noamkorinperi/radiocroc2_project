@@ -21,14 +21,15 @@
 #include "adc.h"
 #include "i2c.h"
 #include "tim.h"
-#include "usb_device.h"
+#include "usart.h"
+#include "dma.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "radioroc2_daq.h"   /* pulls in radioroc2_regs.h + radioroc2.h */
 #include "tmp102.h"          /* temperature sensor on I2C2 */
-#include "usb_stream.h"      /* event streaming over USB CDC */
+#include "usb_stream.h"      /* event streaming over the ST-Link VCP */
 #include "radioroc2_ctrl.h"  /* shadow registers + setters */
 #include "usb_cmd.h"         /* host command interface */
 #include "rr2_test_clocks.h" /* scope test 1: CLK_SM_I2C + CK_READ */
@@ -110,7 +111,7 @@ volatile int32_t  g_temp_milli_c = 0;
 volatile uint8_t  g_temp_online  = 0;   /* 1 = TMP102 ACKed */
 static   uint32_t s_temp_next_ms = 0;   /* next poll deadline */
 
-/* ---- USB streaming --------------------------------------------- */
+/* ---- Host link ------------------------------------------------- */
 static uint32_t s_status_next_ms = 0;   /* status frame deadline */
 /* USER CODE END PV */
 
@@ -163,12 +164,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_TIM1_Init();
-  MX_USB_DEVICE_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   /* ---------------------------------------------------------------
      * RADIOROC2 power-on sequence.
@@ -237,7 +239,7 @@ int main(void)
         RR2_DAQ_EndOfReadout();
     }
 
-    /* Start the USB event stream. Binary framing by default; switch to
+    /* Start the host link. Binary framing by default; switch to
      * USBSTREAM_FMT_TEXT if you want to watch it in a serial terminal. */
     USBStream_Init();
     /* USBStream_SetFormat(USBSTREAM_FMT_TEXT); */
@@ -282,7 +284,7 @@ int main(void)
         /* --- Temperature, polled about once per second ---------------- */
                 TMP_Poll();
 
-                /* --- Push queued USB bytes and emit a periodic status frame --- */
+                /* --- Push queued bytes out and emit a periodic status frame --- */
                 USBStream_Task();
                 USB_SendStatusPeriodic();
 

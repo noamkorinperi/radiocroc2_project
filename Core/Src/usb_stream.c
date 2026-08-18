@@ -10,16 +10,21 @@
  ******************************************************************************
  */
 #include "usb_stream.h"
-#include "usbd_cdc_if.h"     /* CDC_Transmit_FS */
-#include "usb_device.h"      /* MX_USB_DEVICE_Init */
-#include "usbd_core.h"       /* USBD_HandleTypeDef, USBD_STATE_CONFIGURED */
+#include "usb_cmd.h"         /* USBCmd_Feed, fed from the RX interrupt */
+#include "usart.h"           /* huart3 - the ST-Link VCP */
 #include <stdio.h>
 #include <string.h>
 
-/* hUsbDeviceFS is defined in usb_device.c. Depending on the CubeMX
-   version its extern declaration lives in usb_device.h or usbd_cdc_if.h,
-   so declare it explicitly here to be independent of that choice. */
-extern USBD_HandleTypeDef hUsbDeviceFS;
+/* Single byte landing zone for the receive interrupt. Commands are typed
+   by a human, so there is no case for DMA on this side - one interrupt
+   per character costs nothing at the rates a keyboard produces. */
+static uint8_t rx_byte;
+
+/* Length of the DMA transfer currently in flight, 0 when idle. The ring
+   tail is NOT advanced when the transfer starts, only when it finishes,
+   so the bytes being sent stay reserved and the producer cannot walk
+   over data that is still on the wire. */
+static volatile uint32_t tx_len = 0u;
 
 /* ------------------------------------------------------------------ */
 /* Ring buffer                                                         */
@@ -139,8 +144,14 @@ void USBStream_Init(void)
 {
     ring_head      = 0u;
     ring_tail      = 0u;
+    tx_len         = 0u;
     frames_dropped = 0u;
     tx_format      = USBSTREAM_FMT_BINARY;
+
+    /* Arm the receive side. From here on every character re-arms itself
+       from the interrupt, so this is the only place it has to be kicked
+       off - except after an error, which the error callback handles. */
+    (void)HAL_UART_Receive_IT(&huart3, &rx_byte, 1u);
 }
 
 void USBStream_SetFormat(USBStream_Format fmt)
@@ -293,23 +304,86 @@ void USBStream_Task(void)
     uint32_t used;
     uint32_t chunk;
 
+    /* A transfer is already on the wire. Nothing to do - the completion
+       interrupt will free the space and the next pass will pick up. */
+    if (tx_len != 0u) return;
+
     used = ring_used();
     if (used == 0u) return;
 
-    /* Nothing to do until the host has enumerated and configured us.
-       Without this check frames would pile up and be dropped while the
-       cable is unplugged. */
-    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) return;
-
-    /* Send at most one contiguous span, capped, so we never block the
-       main loop for long. */
+    /* One contiguous span only: the DMA walks memory linearly and has
+       no idea the buffer wraps. Capped so a burst cannot monopolise
+       the link and starve the command channel of its replies. */
     chunk = USBSTREAM_RING_SIZE - ring_tail;   /* to end of buffer */
     if (chunk > used)                 chunk = used;
     if (chunk > USBSTREAM_CHUNK_MAX)  chunk = USBSTREAM_CHUNK_MAX;
 
-    if (CDC_Transmit_FS(&ring[ring_tail], (uint16_t)chunk) == USBD_OK) {
-        ring_tail = (ring_tail + chunk) & (uint32_t)(USBSTREAM_RING_SIZE - 1u);
+    /* Claim the span BEFORE handing it to the DMA. Once tx_len is set,
+       ring_free() counts these bytes as occupied, so a producer running
+       between here and the completion interrupt cannot overwrite them. */
+    tx_len = chunk;
+
+    if (HAL_UART_Transmit_DMA(&huart3, &ring[ring_tail],
+                              (uint16_t)chunk) != HAL_OK) {
+        /* Could not start. Release the claim and retry next pass; the
+           data stays queued either way. */
+        tx_len = 0u;
     }
-    /* USBD_BUSY means a transfer is still in flight - just retry next
-       pass, the data stays queued. */
+}
+
+/**
+ * @brief DMA finished pushing a span out of the UART.
+ *
+ * Only now is it safe to release those bytes back to the ring. Doing it
+ * when the transfer STARTED - which is what the USB CDC path used to do
+ * - let a fast burst of events overwrite bytes that were still being
+ * clocked out, corrupting frames under exactly the load where you least
+ * want to lose them.
+ */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART3) return;
+
+    ring_tail = (ring_tail + tx_len) & (uint32_t)(USBSTREAM_RING_SIZE - 1u);
+    tx_len    = 0u;
+}
+
+/* ------------------------------------------------------------------ */
+/* Receive - host commands                                             */
+/* ------------------------------------------------------------------ */
+/**
+ * @brief One character arrived from the host.
+ *
+ * Queues it and re-arms immediately. The parsing happens in the main
+ * loop, because acting on a command can mean hundreds of milliseconds
+ * of blocking I2C and that must never run in interrupt context.
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART3) return;
+
+    USBCmd_Feed(&rx_byte, 1u);
+    (void)HAL_UART_Receive_IT(huart, &rx_byte, 1u);
+}
+
+/**
+ * @brief A receive error aborted the pending read - restart it.
+ *
+ * Framing and overrun errors are expected on a line with no flow
+ * control, especially while the host opens or closes the port. Without
+ * re-arming here a single glitch would silently kill the command
+ * channel for the rest of the session.
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART3) return;
+
+    /* A transmit-side error leaves the claimed span stranded. Release
+       it so the pump is not wedged forever. */
+    if (tx_len != 0u) {
+        ring_tail = (ring_tail + tx_len) & (uint32_t)(USBSTREAM_RING_SIZE - 1u);
+        tx_len    = 0u;
+    }
+
+    (void)HAL_UART_Receive_IT(huart, &rx_byte, 1u);
 }
