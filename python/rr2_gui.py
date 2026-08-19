@@ -163,10 +163,14 @@ class Link:
             if not chunk:
                 continue
             # Text replies and binary frames share the pipe. The decoder
-            # skips anything that is not a valid frame, so printable runs
-            # are surfaced separately for the log.
+            # sorts them: frames come back from feed(), and the bytes it
+            # rejected are recovered as lines by take_text(). Draining
+            # both is what puts stat / sel / dump output - and every ERR:
+            # the firmware sends - into the console instead of nowhere.
             for frame in self._dec.feed(chunk):
                 self.frames.put(frame)
+            for line in self._dec.take_text():
+                self.text.put(line)
 
     def _read_sim(self):
         """Poisson-ish event generator with a Gaussian photopeak."""

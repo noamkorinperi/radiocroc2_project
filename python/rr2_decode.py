@@ -30,6 +30,10 @@ The mask rides in every frame instead of being announced once, so each
 frame stands alone: a dropped frame never desynchronises the ones after
 it. The selection is not assumed contiguous - the detectors are modular
 and any subset of the 64 inputs can be populated.
+
+The command interface shares this one UART and its replies are plain
+text with no framing, so they show up as gaps between frames. Decoder
+keeps those bytes instead of discarding them - see take_text().
 """
 
 import argparse
@@ -92,6 +96,23 @@ def describe_ports():
 FRAME_EVENT = 1
 FRAME_STATUS = 2
 
+# Longest payload the firmware can emit: a 64-channel event is 20 header
+# bytes plus 4 per channel. Status frames are 35. plen is a uint16, so a
+# false sync can claim up to 65535 - bounding it here is what stops the
+# parser stalling on two bytes of data that happened to read A5 5A.
+MAX_PAYLOAD = 20 + 4 * 64          # 276
+
+# Cap on the recovered-text buffer. A link that is pure noise must not be
+# able to grow it without bound.
+MAX_SKIPPED = 8192
+
+# _try_one() has three outcomes, and the caller has to tell them apart:
+# a frame, "the buffer is short - wait", and "that candidate was junk -
+# rescan now". Conflating the last two is what used to make a single bad
+# CRC stop the parse for the rest of the chunk.
+NEED_MORE = object()
+RETRY = object()
+
 
 def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
     """CRC16-CCITT, polynomial 0x1021 - must match usb_stream.c."""
@@ -104,41 +125,96 @@ def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
 
 
 class Decoder:
-    """Incremental parser - feed it arbitrary byte chunks."""
+    """Incremental parser - feed it arbitrary byte chunks.
+
+    Binary frames come back from feed(). Everything else on the wire is
+    kept, not dropped: the firmware's command replies travel as bare
+    text on the same UART and have no framing of their own, so the only
+    way to see them is to hold on to what the frame parser rejected.
+    Collect them with take_text().
+    """
 
     def __init__(self):
         self.buf = bytearray()
+        self.skipped = bytearray()     # non-frame bytes, awaiting take_text
         self.bad_crc = 0
         self.resyncs = 0
 
     def feed(self, chunk: bytes):
+        """Yield every frame completed by this chunk.
+
+        Non-frame bytes are moved aside for take_text(), which the caller
+        should drain alongside this - otherwise replies and ERR: lines go
+        unseen.
+        """
         self.buf.extend(chunk)
         while True:
             frame = self._try_one()
-            if frame is None:
+            if frame is NEED_MORE:
                 return
-            yield frame
+            if frame is not RETRY:
+                yield frame
+
+    def take_text(self):
+        """Complete printable lines recovered from the non-frame bytes.
+
+        The firmware terminates every reply with CRLF, so split on the
+        newline and leave a partial tail for the next call. A rejected
+        frame lands in the same buffer, so runs that are not mostly
+        printable are discarded rather than shown as binary confetti.
+        """
+        out = []
+        while True:
+            nl = self.skipped.find(b"\n")
+            if nl < 0:
+                break
+            raw = bytes(self.skipped[:nl])
+            del self.skipped[:nl + 1]
+            line = raw.decode("ascii", "replace").strip()
+            if line and sum(c.isprintable() for c in line) >= 0.8 * len(line):
+                out.append(line)
+        return out
+
+    def _skip(self, n):
+        """Move n leading bytes out of the frame buffer, keeping them."""
+        self.skipped.extend(self.buf[:n])
+        del self.buf[:n]
+        if len(self.skipped) > MAX_SKIPPED:
+            del self.skipped[:-MAX_SKIPPED]
 
     def _try_one(self):
-        # Find the sync word, discarding anything before it.
+        # Find the sync word. Anything ahead of it is not frame data -
+        # most often a text reply - so it is set aside, not discarded.
         idx = self.buf.find(SYNC)
         if idx < 0:
-            # Keep one byte in case a sync straddles the chunk boundary.
-            if len(self.buf) > 1:
-                del self.buf[:-1]
-            return None
+            # A sync can only straddle the chunk boundary if the last
+            # byte is its first half, so hold that one back and release
+            # the rest. Keeping the tail unconditionally would strand a
+            # reply whose newline lands exactly on the boundary.
+            keep = 1 if self.buf[-1:] == SYNC[:1] else 0
+            if len(self.buf) > keep:
+                self._skip(len(self.buf) - keep)
+            return NEED_MORE
         if idx > 0:
             self.resyncs += 1
-            del self.buf[:idx]
+            self._skip(idx)
 
         if len(self.buf) < 5:
-            return None
+            return NEED_MORE
 
         ftype = self.buf[2]
         plen = struct.unpack_from("<H", self.buf, 3)[0]
+
+        # Judge the candidate on its header before trusting its length.
+        # Waiting on a bogus plen would park the parser for up to 64 kB
+        # while real frames queue up behind it.
+        if plen > MAX_PAYLOAD or ftype not in (FRAME_EVENT, FRAME_STATUS):
+            self._skip(1)
+            return RETRY
+
         total = 5 + plen + 2
         if len(self.buf) < total:
-            return None
+            return NEED_MORE
 
         body = bytes(self.buf[2:5 + plen])           # type + length + payload
         got = struct.unpack_from("<H", self.buf, 5 + plen)[0]
@@ -147,8 +223,8 @@ class Decoder:
         if got != want:
             self.bad_crc += 1
             # Drop the sync byte and rescan - a false sync inside data.
-            del self.buf[:1]
-            return None
+            self._skip(1)
+            return RETRY
 
         payload = bytes(self.buf[5:5 + plen])
         del self.buf[:total]
@@ -268,6 +344,18 @@ def main():
                   f"tmp={'Y' if frame['temp_online'] else 'N'} "
                   f"dwt={'Y' if frame['timing_ok'] else 'N'}")
 
+    def pump(chunk):
+        """One chunk in, both kinds of output out.
+
+        The command replies are not framed and used to be thrown away
+        with the rest of the inter-frame bytes, which hid every ERR:
+        the firmware sent.
+        """
+        for frame in dec.feed(chunk):
+            handle(frame)
+        for line in dec.take_text():
+            print(f"  | {line}")
+
     try:
         if args.file:
             with open(args.file, "rb") as fh:
@@ -275,8 +363,7 @@ def main():
                     chunk = fh.read(4096)
                     if not chunk:
                         break
-                    for frame in dec.feed(chunk):
-                        handle(frame)
+                    pump(chunk)
         else:
             try:
                 import serial  # pyserial
@@ -289,8 +376,7 @@ def main():
                 while True:
                     chunk = ser.read(4096)
                     if chunk:
-                        for frame in dec.feed(chunk):
-                            handle(frame)
+                        pump(chunk)
     except KeyboardInterrupt:
         pass
     finally:
