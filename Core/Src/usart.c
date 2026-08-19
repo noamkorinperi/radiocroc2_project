@@ -40,7 +40,7 @@ void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = RR2_LINK_BAUD;
+  huart3.Init.BaudRate = 921600;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -54,7 +54,22 @@ void MX_USART3_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART3_Init 2 */
-
+  /* The BaudRate line above is regenerated from the .ioc, so a baud set
+   * by hand there would be silently dropped by the next CubeMX run. This
+   * block is preserved across regeneration, which makes RR2_LINK_BAUD the
+   * single authority: change it in usart.h and nowhere else.
+   *
+   * Normally the two already agree and this costs nothing. If they drift,
+   * re-initialising is safe - HAL skips MspInit on a second call, so only
+   * the baud registers are rewritten. */
+  if (huart3.Init.BaudRate != RR2_LINK_BAUD)
+  {
+    huart3.Init.BaudRate = RR2_LINK_BAUD;
+    if (HAL_UART_Init(&huart3) != HAL_OK)
+    {
+      Error_Handler();
+    }
+  }
   /* USER CODE END USART3_Init 2 */
 
 }
