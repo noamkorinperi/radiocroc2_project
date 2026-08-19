@@ -17,6 +17,7 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
+/* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef __DMA_H__
 #define __DMA_H__
 
@@ -26,6 +27,8 @@ extern "C" {
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+
+/* DMA memory to memory transfer handles -------------------------------------*/
 
 /* USER CODE BEGIN Includes */
 
@@ -46,3 +49,4 @@ void MX_DMA_Init(void);
 #endif
 
 #endif /* __DMA_H__ */
+

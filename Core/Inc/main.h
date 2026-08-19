@@ -62,8 +62,8 @@ void Error_Handler(void);
 #define NOR_T1OC_EXTI_IRQn EXTI0_IRQn
 #define CK_READ_Pin GPIO_PIN_1
 #define CK_READ_GPIO_Port GPIOA
-#define CLK_SM_I2C_Pin GPIO_PIN_9
-#define CLK_SM_I2C_GPIO_Port GPIOE
+#define CLK_SM_I2C_Pin GPIO_PIN_8
+#define CLK_SM_I2C_GPIO_Port GPIOA
 #define RSTN_I2C_Pin GPIO_PIN_0
 #define RSTN_I2C_GPIO_Port GPIOD
 #define RSTN_READ_Pin GPIO_PIN_1
