@@ -137,11 +137,19 @@ RR2_Status RR2_DAQ_SelectChannels(const uint8_t *list, uint8_t n);
  * detectors that is 64 clock pulses but only five pairs of ADC
  * conversions - roughly 50 us instead of the 400-500 us a full sweep
  * costs, because the conversions dominate, not the clocking.
+ *
+ * Those two figures assume the converters stay enabled between
+ * channels, which is why SampleBothGains no longer stops them.
  */
 RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt);
 
 /** Sample both gains once, without touching CK_READ. Useful to probe
- *  a single channel or to check the analog path during bring-up.      */
+ *  a single channel or to check the analog path during bring-up.
+ *
+ *  Leaves ADC1 and ADC2 enabled on the way out - a stopped converter
+ *  costs about 25 us to wake, against 5.8 us to convert. They are only
+ *  disabled after a failed conversion, so the next call re-enables from
+ *  a known state.                                                     */
 RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg);
 
 #endif /* RADIOROC2_DAQ_H */

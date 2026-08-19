@@ -120,6 +120,21 @@ void RR2_DAQ_WaitHold(void)
 /* ------------------------------------------------------------------ */
 /* Analog sampling                                                     */
 /* ------------------------------------------------------------------ */
+
+/**
+ * @brief Disable both converters after a failed conversion.
+ *
+ * Only ever called on the error path. A conversion that timed out has
+ * left the peripheral somewhere the state machine does not describe, so
+ * the next sample is better off re-enabling from scratch and paying the
+ * stabilisation wait once than inheriting it.
+ */
+static void RR2_ADC_StopBoth(void)
+{
+    (void)HAL_ADC_Stop(rr2_adc_hg);
+    (void)HAL_ADC_Stop(rr2_adc_lg);
+}
+
 RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg)
 {
     if ((hg == NULL) || (lg == NULL))               return RR2_ERR_DATA;
@@ -127,29 +142,38 @@ RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg)
 
     /* ADC1 and ADC2 are independent peripherals, so starting both back
        to back lets the two gains convert in parallel: one conversion
-       time for both samples instead of two.                          */
+       time for both samples instead of two.
+
+       Neither is stopped on the way out. HAL_ADC_Start only pays the
+       Tstab wait when it finds ADON clear, so leaving the converters
+       enabled turns every later call into a bare SWSTART. That wait is
+       not the 3 us the constant suggests: the HAL spins 648 times on a
+       volatile counter, which is six instructions an iteration, so it
+       costs about 25 us in reality - per converter, per channel, next
+       to a conversion that takes 5.8 us. Stopping between channels was
+       spending nine tenths of the readout waiting for an ADC that had
+       never gone anywhere.
+
+       The converters idle between conversions, so the only cost of
+       leaving them on is their bias current. */
     if (HAL_ADC_Start(rr2_adc_hg) != HAL_OK) return RR2_ERR_ADC;
     if (HAL_ADC_Start(rr2_adc_lg) != HAL_OK) {
-        HAL_ADC_Stop(rr2_adc_hg);
+        RR2_ADC_StopBoth();
         return RR2_ERR_ADC;
     }
 
     if (HAL_ADC_PollForConversion(rr2_adc_hg, RR2_ADC_TIMEOUT_MS) != HAL_OK) {
-        HAL_ADC_Stop(rr2_adc_hg);
-        HAL_ADC_Stop(rr2_adc_lg);
+        RR2_ADC_StopBoth();
         return RR2_ERR_ADC;
     }
     if (HAL_ADC_PollForConversion(rr2_adc_lg, RR2_ADC_TIMEOUT_MS) != HAL_OK) {
-        HAL_ADC_Stop(rr2_adc_hg);
-        HAL_ADC_Stop(rr2_adc_lg);
+        RR2_ADC_StopBoth();
         return RR2_ERR_ADC;
     }
 
     *hg = (uint16_t)HAL_ADC_GetValue(rr2_adc_hg);
     *lg = (uint16_t)HAL_ADC_GetValue(rr2_adc_lg);
 
-    HAL_ADC_Stop(rr2_adc_hg);
-    HAL_ADC_Stop(rr2_adc_lg);
     return RR2_OK;
 }
 
