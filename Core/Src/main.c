@@ -157,7 +157,23 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  /* Flash ART accelerator and prefetch buffer.
+   *
+   * HAL_Init() has already switched both on from PREFETCH_ENABLE and
+   * ART_ACCELERATOR_ENABLE in stm32f7xx_hal_conf.h, so these two lines
+   * normally set bits that are already set. They are here because the
+   * .ioc has no knob for either - CORTEX_M7 tracks CPU_ICache and
+   * nothing else - so the next Generate Code rewrites both defines back
+   * to 0U and the setting would vanish with nothing to show for it.
+   * Same trap as the link baud; see USART3_Init 2. This block survives
+   * regeneration, so the configuration self-heals.
+   *
+   * Safe next to the caches: ART only accelerates instruction fetch
+   * from flash, and every timing constraint in the DAQ is gated by
+   * DWT->CYCCNT, which counts core cycles regardless of fetch speed.
+   * D-cache stays off deliberately - the DMA writes straight to RAM. */
+  __HAL_FLASH_ART_ENABLE();
+  __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
   /* USER CODE END Init */
 
   /* Configure the system clock */
