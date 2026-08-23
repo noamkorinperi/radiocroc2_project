@@ -6,7 +6,7 @@ Pages
     Main       navigation hub
     Settings   push Slow Control parameters to the ASIC
     Measure    run an acquisition and watch the spectrum build up
-    History    the last six measurements, with Excel export
+    History    saved measurements, with Excel export
     Help       static instructions
 
 Requirements
@@ -56,7 +56,12 @@ except ImportError:
 
 ADC_MAX = 4095                      # 12-bit ADC
 STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "measurements")
-MAX_STORED = 6
+RAW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw")
+
+# A thermal sweep is six temperature points, and it gets repeated. Six
+# slots meant the pedestal run was deleted on the way to the last point,
+# silently, at the end of a day in the chamber. Histograms are a few kB.
+MAX_STORED = 200
 
 # A restrained instrument palette: light background, one accent.
 C_BG = "#f4f6f8"
@@ -462,8 +467,9 @@ def export_measurement(rec, path):
     ws.add_chart(chart, "G2")
 
     meta = wb.create_sheet("Metadata")
-    for k in ("started", "duration_s", "channel", "source", "bins", "lo", "hi",
-              "total", "overflow", "temp_c", "rate_cps", "note", "settings"):
+    for k in ("started", "label", "duration_s", "channel", "source",
+              "bins", "lo", "hi", "total", "overflow", "temp_c", "rate_cps",
+              "raw_file", "note", "settings"):
         meta.append([k, str(rec.get(k, ""))])
     meta.append([])
     meta.append(["axis", "raw ADC counts on OUT_AMUXLG"])
@@ -796,6 +802,17 @@ class PageMeasure(Page):
                   style="Sub.TLabel")\
             .grid(row=0, column=6, sticky="w", padx=(18, 0))
 
+        # Names the raw file. Type the temperature point and the DAC
+        # setting here and the run identifies itself six months later.
+        ttk.Label(ctl, text="Run label").grid(row=1, column=0, sticky="w",
+                                              pady=(10, 0))
+        self.v_label = tk.StringVar(value="")
+        ttk.Entry(ctl, textvariable=self.v_label, width=28)\
+            .grid(row=1, column=1, columnspan=3, sticky="w",
+                  padx=(6, 18), pady=(10, 0))
+        ttk.Label(ctl, text="e.g.  T30_dac255", style="Sub.TLabel")\
+            .grid(row=1, column=4, columnspan=3, sticky="w", pady=(10, 0))
+
         bar = ttk.Frame(self)
         bar.pack(fill="x")
         self.btn_start = ttk.Button(bar, text="Start", style="Accent.TButton",
@@ -809,6 +826,12 @@ class PageMeasure(Page):
         ttk.Checkbutton(bar, text="log scale", variable=self.v_log,
                         command=lambda: self.canvas.set_log(self.v_log.get()))\
             .pack(side="left", padx=16)
+        # The histogram is one channel. The raw file is every channel in
+        # the readout window, which is what makes the dark neighbours -
+        # and with them the pedestal - recoverable after the fact.
+        self.v_raw = tk.IntVar(value=1)
+        ttk.Checkbutton(bar, text="log raw events", variable=self.v_raw)\
+            .pack(side="left")
         ttk.Button(bar, text="Save measurement", command=self.save)\
             .pack(side="right")
 
@@ -826,6 +849,10 @@ class PageMeasure(Page):
         self.t_start = None
         self.last_temp = 0.0
         self._last_ui = 0.0
+        self.raw_fh = None
+        self.raw_writer = None
+        self.raw_path = ""
+        self.raw_rows = 0
 
     # -- control
     def start(self):
@@ -834,6 +861,7 @@ class PageMeasure(Page):
             return
         self.hist.reset(self.v_bins.get(), 0, ADC_MAX)
         self.canvas.set_hist(self.hist)
+        self._open_raw()
         self.running = True
         self.t_start = time.time()
         self.btn_start.configure(state="disabled")
@@ -841,8 +869,44 @@ class PageMeasure(Page):
 
     def stop(self):
         self.running = False
+        self._close_raw()
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+
+    # -- raw event log
+    def _open_raw(self):
+        self._close_raw()
+        self.raw_rows = 0
+        if not self.v_raw.get():
+            self.raw_path = ""
+            return
+        os.makedirs(RAW_DIR, exist_ok=True)
+        label = "".join(c if (c.isalnum() or c in "._-") else "_"
+                        for c in self.v_label.get().strip())
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"raw_{stamp}_{label}.csv" if label else f"raw_{stamp}.csv"
+        self.raw_path = os.path.join(RAW_DIR, name)
+        try:
+            self.raw_fh = open(self.raw_path, "w", newline="", encoding="utf-8")
+        except OSError as exc:
+            self.raw_path = ""
+            messagebox.showwarning(
+                "Raw log not started",
+                f"Could not open the raw file:\n{exc}\n\n"
+                "The histogram still runs, but the per-event data is not "
+                "being kept.")
+            return
+        self.raw_writer = csv.writer(self.raw_fh)
+        self.raw_writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg"])
+
+    def _close_raw(self):
+        if self.raw_fh:
+            try:
+                self.raw_fh.close()
+            except OSError:
+                pass
+        self.raw_fh = None
+        self.raw_writer = None
 
     def clear(self):
         self.hist.reset()
@@ -857,6 +921,16 @@ class PageMeasure(Page):
         if frame["type"] != "event" or not self.running:
             return
 
+        # Raw first, and for the whole window: the channel the histogram
+        # skips is exactly the one carrying the baseline.
+        if self.raw_writer:
+            first = frame["first_ch"]
+            temp = f"{frame['temp_c']:.3f}"
+            for i in range(frame["count"]):
+                self.raw_writer.writerow([frame["seq"], frame["t_ms"], temp,
+                                          first + i, frame["lg"][i]])
+            self.raw_rows += frame["count"]
+
         ch = self.v_ch.get()
         idx = ch - frame["first_ch"]
         if idx < 0 or idx >= frame["count"]:
@@ -870,22 +944,32 @@ class PageMeasure(Page):
         elapsed = time.time() - self.t_start
         dur = self.v_dur.get()
         if dur and elapsed >= dur:
+            raw = os.path.basename(self.raw_path) if self.raw_path else ""
             self.stop()
             self.lbl.configure(text=f"finished: {self.hist.total} counts "
-                                    f"in {elapsed:.1f} s")
+                                    f"in {elapsed:.1f} s"
+                                    + (f" | raw: {raw}" if raw else ""))
             self.canvas.redraw()
             return
         now = time.time()
         if now - self._last_ui > 0.25:          # keep redraws cheap
             self._last_ui = now
             self.canvas.redraw()
+            # Four flushes a second, so a crash in hour three of a sweep
+            # costs a quarter second of events, not the whole point.
+            if self.raw_fh:
+                try:
+                    self.raw_fh.flush()
+                except OSError:
+                    pass
             rate = self.hist.total / elapsed if elapsed > 0 else 0
             pk = self.hist.peak_bin()
             pk_txt = f"peak ADC {self.hist.centre_of(pk):.0f}" if pk is not None else "-"
+            raw_txt = f" | raw {self.raw_rows} rows" if self.raw_writer else ""
             self.lbl.configure(
                 text=f"running {elapsed:6.1f} s | {self.hist.total} counts | "
                      f"{rate:6.1f} cps | {pk_txt} | T {self.last_temp:.1f} C | "
-                     f"overflow {self.hist.overflow}")
+                     f"overflow {self.hist.overflow}{raw_txt}")
 
     def save(self):
         if self.hist.total == 0:
@@ -905,6 +989,8 @@ class PageMeasure(Page):
             "overflow": self.hist.overflow,
             "temp_c": round(self.last_temp, 2),
             "rate_cps": round(self.hist.total / elapsed, 2) if elapsed else 0,
+            "label": self.v_label.get().strip(),
+            "raw_file": os.path.basename(self.raw_path) if self.raw_path else "",
             "note": "simulator" if self.app.link.sim else "",
             "settings": "",
         }
@@ -921,14 +1007,14 @@ class PageHistory(Page):
         top.pack(fill="x")
         ttk.Button(top, text="< Main", command=lambda: self.app.show("main"))\
             .pack(side="left")
-        ttk.Label(top, text="Last six measurements", style="H1.TLabel")\
+        ttk.Label(top, text="Saved measurements", style="H1.TLabel")\
             .pack(side="left", padx=12)
         ttk.Button(top, text="Refresh", command=self.reload).pack(side="right")
 
-        cols = ("started", "duration_s", "channel", "total",
+        cols = ("started", "label", "duration_s", "channel", "total",
                 "rate_cps", "temp_c", "overflow")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=7)
-        widths = (170, 90, 80, 100, 100, 90, 90)
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
+        widths = (150, 150, 80, 70, 90, 90, 80, 80)
         for c, w in zip(cols, widths):
             self.tree.heading(c, text=c.replace("_", " "))
             self.tree.column(c, width=w, anchor="center")
@@ -956,7 +1042,8 @@ class PageHistory(Page):
             self.tree.delete(iid)
         for i, r in enumerate(self.records):
             self.tree.insert("", "end", iid=str(i), values=(
-                r.get("started", ""), r.get("duration_s", ""),
+                r.get("started", ""), r.get("label", ""),
+                r.get("duration_s", ""),
                 r.get("channel", ""), r.get("total", ""),
                 r.get("rate_cps", ""), r.get("temp_c", ""),
                 r.get("overflow", "")))
@@ -1106,7 +1193,17 @@ TROUBLESHOOTING
 
 FILES
     Measurements are kept as JSON under the measurements folder next to
-    this script. Only the newest six are retained.
+    this script - the histogram, plus what it was taken under.
+
+    With "log raw events" ticked, every event is also written to a CSV
+    under the raw folder: one row per channel, with the temperature the
+    board reported for that event. The histogram is one channel; the raw
+    file is the whole readout window, including the dark channels that
+    carry the baseline. Analysis that needs a pedestal needs this file.
+
+    Put the temperature point and the DAC setting in "Run label" before
+    starting. It names the raw file and shows up in History, which is
+    what tells six runs apart afterwards.
 """
 
     def build(self):
