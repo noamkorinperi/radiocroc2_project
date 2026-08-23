@@ -219,6 +219,19 @@ static void ed_enable7(uint8_t c, uint32_t en, uint32_t unused)
     else    sh.ch[c][RR2_CH_SUB_EN2] &= (uint8_t)~mask;
 }
 
+static void ed_discri(uint8_t c, uint32_t en, uint32_t unused)
+{
+    (void)unused;
+    /* subadd 6: the three discriminators only. Preamps, input DAC and
+       time preamp are left alone, so a channel can keep producing a
+       shaped baseline while being unable to fire a trigger.          */
+    const uint8_t mask = (uint8_t)((1u << RR2_EN_DISCRI1_Pos) |
+                                   (1u << RR2_EN_DISCRI2_Pos) |
+                                   (1u << RR2_EN_DISCRICHARGE_Pos));
+    if (en) sh.ch[c][RR2_CH_SUB_EN] |=  mask;
+    else    sh.ch[c][RR2_CH_SUB_EN] &= (uint8_t)~mask;
+}
+
 static void ed_ctest(uint8_t c, uint32_t en, uint32_t use_ctest)
 {
     uint8_t b = sh.ch[c][RR2_CH_SUB_EN2];
@@ -279,6 +292,11 @@ RR2_Status RR2_Ctrl_SetChannelEnabled(uint8_t ch, uint8_t enable)
     if (st != RR2_OK) return st;
 
     return for_each_channel(ch, RR2_CH_SUB_EN2, ed_enable7, enable, 0u);
+}
+
+RR2_Status RR2_Ctrl_SetDiscriminators(uint8_t ch, uint8_t enable)
+{
+    return for_each_channel(ch, RR2_CH_SUB_EN, ed_discri, enable, 0u);
 }
 
 RR2_Status RR2_Ctrl_SetChargeInjection(uint8_t ch, uint8_t enable, uint8_t use_ctest)

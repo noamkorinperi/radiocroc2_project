@@ -94,6 +94,7 @@ static void cmd_help(void)
     reply("  ch <n|all> patgain <0-63>\r\n");
     reply("  ch <n|all> trim <t1> <t2>      (0-63)\r\n");
     reply("  ch <n|all> on|off\r\n");
+    reply("  ch <n|all> discri <0|1>        trigger, without the rest\r\n");
     reply("  ch <n|all> ctest <0|1> <cap 0|1>\r\n");
     reply("  ch <n> dump\r\n");
     reply("  th <dac1> <dac2> <dacq>        (0-1023)\r\n");
@@ -164,6 +165,8 @@ static void cmd_ch(void)
         reply_status(RR2_Ctrl_SetChannelEnabled(ch, 1u));
     } else if (arg_is(2u, "off")) {
         reply_status(RR2_Ctrl_SetChannelEnabled(ch, 0u));
+    } else if (arg_is(2u, "discri")) {
+        reply_status(RR2_Ctrl_SetDiscriminators(ch, (uint8_t)arg_i(3u, 1)));
     } else if (arg_is(2u, "ctest")) {
         reply_status(RR2_Ctrl_SetChargeInjection(ch, (uint8_t)arg_i(3u, 0),
                                                      (uint8_t)arg_i(4u, 0)));

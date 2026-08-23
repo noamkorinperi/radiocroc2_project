@@ -117,6 +117,17 @@ RR2_Status RR2_Ctrl_SetThresholdTrim(uint8_t ch, uint8_t trim1, uint8_t trim2);
  *  they stop contributing to the NOR triggers.                       */
 RR2_Status RR2_Ctrl_SetChannelEnabled(uint8_t ch, uint8_t enable);
 
+/** The three discriminators of a channel, without touching anything
+ *  else it does. A channel with them off still shapes its input and
+ *  still presents a peak-detector code to the readout - it simply
+ *  cannot fire the NOR trigger.
+ *
+ *  That is what a baseline reference channel wants: an unconnected
+ *  input is floating, and a spurious hit there raises the same trigger
+ *  as a real gamma, which looks exactly like a detector that ignores
+ *  its source.                                                       */
+RR2_Status RR2_Ctrl_SetDiscriminators(uint8_t ch, uint8_t enable);
+
 /** Internal charge injection, for exercising the analog chain with no
  *  radiation source. use_ctest selects the 1.5 pF test capacitor.    */
 RR2_Status RR2_Ctrl_SetChargeInjection(uint8_t ch, uint8_t enable, uint8_t use_ctest);

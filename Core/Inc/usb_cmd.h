@@ -25,6 +25,9 @@
  *   ch <n|all> patgain <0-63>          time preamp gain
  *   ch <n|all> trim <t1 0-63> <t2 0-63>   per-channel threshold trim
  *   ch <n|all> on|off                  enable / disable the channel
+ *   ch <n|all> discri <0|1>            discriminators only: lets a
+ *                                      channel report a baseline
+ *                                      without being able to trigger
  *   ch <n|all> ctest <0|1> <use_cap 0|1>  internal charge injection
  *   ch <n> dump                        show the shadow for one channel
  *

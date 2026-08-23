@@ -446,6 +446,18 @@ static RR2_Status RR2_ApplyExperimentConfig(void)
          c < (uint8_t)(RR2_EXP_FIRST_CH + RR2_EXP_NUM_CH); ++c) {
         st = RR2_Ctrl_SetChannelEnabled(c, 1u);
         if (st != RR2_OK) return st;
+
+        /* Everything in the window except the signal channel is there
+           to report a baseline, not to trigger. Their inputs are
+           unconnected and floating, and a spurious discriminator hit
+           raises the same NOR trigger as a real gamma - which presents
+           as a count rate that ignores the source, the one symptom
+           first light is looking for. Shapers and peak detectors stay
+           on; only the discriminators go. */
+        if (c != RR2_EXP_SIGNAL_CH) {
+            st = RR2_Ctrl_SetDiscriminators(c, 0u);
+            if (st != RR2_OK) return st;
+        }
     }
 
     /* Slow shaping, ~1.7 us peaking, hold delay stretched to match.
