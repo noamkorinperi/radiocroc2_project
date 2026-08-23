@@ -128,7 +128,35 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  /* Flash prefetch buffer and ART accelerator.
+   *
+   * These two lines are the only thing that switches them on. HAL_Init()
+   * does it too, but only behind PREFETCH_ENABLE and
+   * ART_ACCELERATOR_ENABLE in stm32f7xx_hal_conf.h, and both are left at
+   * the value CubeMX writes - which is 0U, i.e. off.
+   *
+   * Leaving them off there is deliberate. That file has a USER CODE
+   * block around its header and nowhere else, so a define edited at line
+   * 151 is rewritten by the next Generate Code with nothing to show for
+   * it. Enabling from here instead survives regeneration, the same way
+   * the link baud does in USART3_Init 2 - and it means hal_conf.h can be
+   * regenerated freely without taking the setting with it.
+   *
+   * The prefetch buffer is what earns its keep: at 216 MHz the flash
+   * needs seven wait states, and the buffer is what hides them.
+   *
+   * ART is honestly along for the ride. It accelerates instruction fetch
+   * over ITCM only, and the linker maps FLASH at 0x08000000, which is
+   * the AXIM interface - so in this configuration it does nothing. It is
+   * enabled because it costs one instruction and would be correct if the
+   * code ever moves.
+   *
+   * Safe next to the DAQ: every timing constraint there is a minimum
+   * gated by DWT->CYCCNT, which counts core cycles regardless of how
+   * fast instructions arrive. D-cache stays off deliberately - the DMA
+   * writes straight to RAM. */
+  __HAL_FLASH_ART_ENABLE();
+  __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
   /* USER CODE END Init */
 
   /* Configure the system clock */
