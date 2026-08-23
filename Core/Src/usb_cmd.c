@@ -7,6 +7,7 @@
  */
 #include "usb_cmd.h"
 #include "radioroc2_ctrl.h"
+#include "rr2_i2ctest.h"
 #include "usb_stream.h"
 #include <string.h>
 #include <stdlib.h>
@@ -99,6 +100,7 @@ static void cmd_help(void)
     reply("  trig <0-15> | hold int|ext | mux <hg> <lg>\r\n");
     reply("  preset csi\r\n");
     reply("  w <addr> <sub> <data> | r <addr> <sub>\r\n");
+    reply("  i2ctest                        Slow Control link test\r\n");
 }
 
 static void cmd_dump(uint8_t ch)
@@ -240,6 +242,12 @@ static void execute(void)
                                  (uint8_t)arg_i(2u, 0), &v);
         if (st == RR2_OK) reply_kv("val", (int32_t)v);
         else              reply_status(st);
+    }
+    else if (arg_is(0u, "i2ctest")) {
+        /* Blocks for up to about two seconds. Nothing else may drive
+           the bus while it runs, which is exactly what running it from
+           here guarantees - the main loop is inside this call. */
+        (void)RR2_I2CTest_Run();
     }
     else {
         reply("ERR: unknown command, try 'help'\r\n");

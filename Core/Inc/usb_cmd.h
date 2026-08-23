@@ -40,6 +40,11 @@
  *
  *   w <addr> <sub> <data>              raw Slow Control write
  *   r <addr> <sub>                     raw Slow Control read
+ *
+ *   i2ctest                            Slow Control link test: address
+ *                                      scan + repeated write/read/verify,
+ *                                      reported as i2ctest.* key=value
+ *                                      lines. See rr2_i2ctest.h.
  ******************************************************************************
  */
 #ifndef USB_CMD_H
