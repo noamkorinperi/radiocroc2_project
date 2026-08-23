@@ -32,8 +32,7 @@
 #include "usb_stream.h"      /* event streaming over the ST-Link VCP */
 #include "radioroc2_ctrl.h"  /* shadow registers + setters */
 #include "usb_cmd.h"         /* host command interface */
-#include "rr2_test_clocks.h" /* scope test 1: CLK_SM_I2C + CK_READ */
-#include "rr2_test_i2c.h"    /* scope test 2: Slow Control I2C bus */
+#include "rr2_test_i2c.h"    /* Slow Control I2C health check */
 #include <stdio.h>           /* optional: printf over SWO/VCP */
 /* USER CODE END Includes */
 
@@ -59,6 +58,50 @@
  * Leave it empty to start with all 64 enabled.
  * ------------------------------------------------------------- */
 static const uint8_t RR2_DETECTOR_CHANNELS[] = { 0, 1, 2, 3, 4 };
+
+/* ---------------------------------------------------------------
+ * Manual scope walk-through, stepped with F8 from the debugger.
+ *
+ * Three stages, one per signal. Each puts exactly ONE signal on the
+ * wire and parks the other two, so nothing on the screen can be
+ * mistaken for the trace you are measuring.
+ *
+ * Set to 0 to get the plain firmware back: the stages and the three
+ * breakpoint anchors disappear completely and main() goes straight
+ * from bring-up into the DAQ loop.
+ *
+ * The block at the end of USER CODE 2 says where the breakpoints go.
+ * ------------------------------------------------------------- */
+#define RR2_MANUAL_DEBUG        1
+
+/* Time limit on each of the two CPU-generated stages, in ms, and 0
+ * for "no limit" on either.
+ *
+ * CK_READ is bounded so the walk-through always reaches the SCL stage
+ * on its own. SCL is deliberately unbounded - it is the one under
+ * investigation right now, so it stays on the wire for as long as you
+ * leave the core running. Leave it with Suspend then F8, or by setting
+ * g_dbg_stop to 1 from Live Expressions without halting at all.
+ *
+ * Both are editable live as g_dbg_pa1_ms / g_dbg_scl_ms. */
+#define RR2_DBG_PA1_MS          10000u
+#define RR2_DBG_SCL_MS          0u
+
+/* Wall-clock time unaccounted for by SysTick that counts as "the
+ * debugger stopped us". Ordinary loop jitter is microseconds, and a
+ * Suspend followed by a Resume by hand is never under a few hundred
+ * milliseconds, so there is a wide margin between the two. */
+#define RR2_DBG_HALT_MS         100u
+
+/* CK_READ pulses timed as one block. A single pulse is ~200 ns, so
+ * reading the cycle counter around each one would cost more than the
+ * pulse being measured. */
+#define RR2_DBG_CKREAD_BLOCK    1000u
+
+/* Slow Control frame timeout, and the idle gap left between frames
+ * so the scope has something quiet to trigger against. */
+#define RR2_DBG_I2C_TIMEOUT_MS  50u
+#define RR2_DBG_I2C_GAP_MS      1u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -85,12 +128,6 @@ volatile uint8_t  g_rr2_sc_error = 0;
 volatile RR2_Status g_rr2_cfg_status = RR2_OK;
 volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
 
-/* Result of the boot-time CHIP_ID sweep. Inspect these first when the
-   ASIC looks dead - they separate "wrong address" from "no bus". */
-volatile uint16_t g_rr2_chip_map    = 0;      /* bit N = id N answered */
-volatile uint8_t  g_rr2_chip_found  = RR2_CHIP_ID_NONE;
-volatile uint8_t  g_rr2_chip_active = 0;      /* id actually in use    */
-
 /* Channels carrying a detector. Mirrors the DAQ mask, exposed here so
    it shows up next to the rest of the state in the debugger. */
 volatile uint64_t g_rr2_channel_mask = 0;
@@ -113,6 +150,43 @@ static   uint32_t s_temp_next_ms = 0;   /* next poll deadline */
 
 /* ---- Host link ------------------------------------------------- */
 static uint32_t s_status_next_ms = 0;   /* status frame deadline */
+
+/* ---- Manual scope walk-through --------------------------------- */
+#if RR2_MANUAL_DEBUG
+/* Stages completed so far. Also the quickest way to tell which of the
+   three breakpoints you are currently sitting on.                   */
+volatile uint8_t  g_dbg_stage  = 0u;
+
+/* Controls - editable from Live Expressions while a stage runs.     */
+volatile uint32_t g_dbg_pa1_ms = RR2_DBG_PA1_MS;   /* 0 = no limit   */
+volatile uint32_t g_dbg_scl_ms = RR2_DBG_SCL_MS;   /* 0 = no limit   */
+volatile uint8_t  g_dbg_stop   = 0u;               /* 1 = leave now  */
+/* Why the last stage ended - 0 while one is still running.
+   1 = the stage time limit elapsed, 2 = g_dbg_stop, 3 = Suspend. */
+volatile uint8_t  g_dbg_exit_reason = 0u;
+
+/* Stage 1 - PE9 / CLK_SM_I2C, read back out of the timer registers.
+   Named for the pin it actually comes out of: this signal used to be
+   on PA8 and the whole point of reading it back from the registers is
+   that it stays honest when the board moves.                        */
+volatile uint32_t g_dbg_pe9_hz      = 0u;
+volatile uint8_t  g_dbg_pe9_running = 0u;  /* counter AND output on  */
+
+/* Stage 2 - PA1 / CK_READ, timed with the DWT cycle counter.        */
+volatile uint32_t g_dbg_pa1_period_ns = 0u;
+volatile uint32_t g_dbg_pa1_freq_khz  = 0u;
+volatile uint32_t g_dbg_pa1_pulses    = 0u;
+
+/* Stage 3 - PB8 / SCL, timed per Slow Control frame.                */
+volatile uint8_t  g_dbg_scl_status   = 0u; /* 0 OK, 1 ERROR, 3 NACK  */
+volatile uint32_t g_dbg_scl_khz      = 0u;
+volatile uint32_t g_dbg_scl_frame_us = 0u;
+volatile uint32_t g_dbg_scl_frames   = 0u;
+volatile uint32_t g_dbg_scl_ok       = 0u;
+volatile uint32_t g_dbg_scl_fail     = 0u;
+/* clk_sm_i2c : SCL, x10. The ASIC needs 20, so 200 is the target.   */
+volatile uint32_t g_dbg_ratio_x10    = 0u;
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -121,10 +195,14 @@ static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
 static void RR2_HW_ReleaseResets(void);
 static void RR2_StartClocks(void);
-static uint8_t RR2_Bringup(void);
 static void RR2_ServiceEvent(void);
 static void TMP_Poll(void);
 static void USB_SendStatusPeriodic(void);
+#if RR2_MANUAL_DEBUG
+static void RR2_Dbg_Stage1_ClkSmI2c(void);
+static void RR2_Dbg_Stage2_CkRead(void);
+static void RR2_Dbg_Stage3_Scl(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -216,24 +294,30 @@ int main(void)
      * zeros everywhere. */
     RR2_Ctrl_ResetShadow();
 
-    /* CHIP_ID<3:0> is strapped on the board and cannot be read from any
-     * register - the id IS part of the I2C address. So ask all 16 and
-     * point the driver at whichever one answers. Without this, a board
-     * strapped to anything other than RR2_CHIP_ID would look completely
-     * dead even though the bus is perfectly healthy.
-     *
-     * g_rr2_chip_map is the full picture, kept for the debugger:
-     *   0      nothing answered - check power, resets and pull-ups
-     *   one bit set   normal
-     *   several bits  more than one ASIC, or a foreign device on the bus
-     */
-    g_rr2_chip_found = RR2_ScanChipId((uint16_t *)&g_rr2_chip_map);
-    if (g_rr2_chip_found != RR2_CHIP_ID_NONE) {
-        RR2_SetChipId(g_rr2_chip_found);
-    }
-    g_rr2_chip_active = RR2_GetChipId();
+    /* Start the host link before the health check rather than after, so
+     * the check has somewhere to print its report. Binary framing by
+     * default; switch to USBSTREAM_FMT_TEXT to watch it in a terminal.
+     * Text lines are sent verbatim in either format, so the report is
+     * readable without switching. */
+    USBStream_Init();
+    /* USBStream_SetFormat(USBSTREAM_FMT_TEXT); */
 
-    g_rr2_online = RR2_Bringup();
+    /* ---------------------------------------------------------------
+     * Slow Control I2C health check.
+     *
+     * This is what decides whether there is a chip to configure, and it
+     * is the only thing that can answer the CHIP_ID question: the id is
+     * strapped in copper and IS the top half of the I2C address, so no
+     * register holds it and the sweep is the only way to learn it. A
+     * board strapped to anything other than RR2_CHIP_ID would otherwise
+     * look completely dead on a perfectly healthy bus.
+     *
+     * It probes addresses only - never a data byte - so nothing here can
+     * disturb the ASIC configuration. On a pass it points the driver at
+     * the id it found. See rr2_test_i2c.h for the variables to read when
+     * it fails.
+     * ------------------------------------------------------------- */
+    g_rr2_online = (RR2_TestI2C_Run() == RR2_TEST_PASS) ? 1u : 0u;
 
     /* Tell the readout which inputs to digitise. Done before PushAll so
      * the enable bits it writes already reflect the selection, instead
@@ -260,32 +344,70 @@ int main(void)
         RR2_DAQ_EndOfReadout();
     }
 
-    /* Start the host link. Binary framing by default; switch to
-     * USBSTREAM_FMT_TEXT if you want to watch it in a serial terminal. */
-    USBStream_Init();
-    /* USBStream_SetFormat(USBSTREAM_FMT_TEXT); */
-
     /* Host command interface. The shadow must mirror whatever we just
      * wrote to the ASIC, otherwise the first host edit would push stale
      * neighbouring bits. */
     USBCmd_Init();
 
 
-    /* Breakpoint here during bring-up and inspect:
-     *   g_rr2_online     -> 1 if the ASIC ACKed its Chip ID
+    /* Inspect here during bring-up, in this order:
+     *   g_test_verdict   -> RR2_TEST_PASS if the I2C link is healthy
+     *   g_test_chipid    -> the CHIP_ID that answered
+     *   g_test_reason    -> why it did not, when it did not
      *   g_rr2_cfg_status -> RR2_OK if the whole config sequence passed */
+
+#if RR2_MANUAL_DEBUG
+    /* ===============================================================
+     * MANUAL SCOPE WALK-THROUGH - three stops, three signals.
+     *
+     * Put a breakpoint on each of the three lines marked BREAKPOINT
+     * below (double-click the left margin), then just keep pressing
+     * F8 (Resume):
+     *
+     *   F8 #1  ->  stops at BREAKPOINT 1    PE9  CLK_SM_I2C is live
+     *   F8 #2  ->  stops at BREAKPOINT 2    PA1  CK_READ    has run
+     *   F8 #3  ->  stops at BREAKPOINT 3    PB8  SCL        has run
+     *   F8 #4  ->  normal firmware, straight into the DAQ loop
+     *
+     * WHY THE THREE STAGES DO NOT BEHAVE ALIKE
+     * PE9 comes out of TIM1 in hardware, so it keeps toggling while
+     * the core sits at a breakpoint. Park the probe on it and measure
+     * it at any of the three stops, in your own time.
+     * PA1 and PB8 are produced BY the CPU - bit-banged, and the I2C
+     * peripheral being fed transactions - so they only exist while
+     * the core is RUNNING, and the two are bounded differently:
+     *
+     *   PA1  runs 10 s and ends by itself, so F8 #3 always gets you
+     *        through to the stage that matters.
+     *   PB8  runs for as long as you leave the core running. Take all
+     *        the time you need on SCL, then press Suspend and F8 - the
+     *        stage notices the halt, because TIM2 keeps counting
+     *        through it while SysTick does not. Setting g_dbg_stop to
+     *        1 from Live Expressions does the same without halting.
+     *
+     * Swap either behaviour live with g_dbg_pa1_ms / g_dbg_scl_ms; 0
+     * means unbounded. g_dbg_exit_reason says how a stage ended.
+     * =============================================================== */
+    RR2_Dbg_Stage1_ClkSmI2c();  /* PE9 up, the other two lines quiet */
+    g_dbg_stage = 1;   /* <<<<< BREAKPOINT 1 - PE9 / CLK_SM_I2C <<<<< */
+
+    /*RR2_Dbg_Stage2_CkRead();    /* PA1 pulses, g_dbg_pa1_ms long     */
+    /*g_dbg_stage = 2;   /* <<<<< BREAKPOINT 2 - PA1 / CK_READ <<<<<<<< */
+
+    RR2_Dbg_Stage3_Scl();       /* PB8 frames, until you stop it     */
+    g_dbg_stage = 3;   /* <<<<< BREAKPOINT 3 - PB8 / SCL <<<<<<<<<<<< */
+#endif
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
     while (1)
       {
-        /* --- Scope tests, driven from the debugger -------------------- */
-        /* Both are no-ops until their mode variable is set from Live
-           Expressions, and both block until it is cleared again. Keep
-           them ahead of the DAQ so nothing else drives the lines while
-           a probe is on them. See rr2_test_clocks.h / rr2_test_i2c.h. */
-        RR2_TestClocks_Task();
+        /* --- I2C health check, re-run on demand ---------------------- */
+        /* A no-op until g_test_run or g_test_repeat is set from Live
+           Expressions. Kept ahead of the DAQ so the sweep never has to
+           share the bus with a readout. See rr2_test_i2c.h. */
         RR2_TestI2C_Task();
 
         /* --- Slow Control error reported by the ASIC ------------------ */
@@ -415,15 +537,6 @@ static void RR2_HW_ReleaseResets(void)
 }
 
 /**
- * @brief Stage-1 bring-up check: does the ASIC answer on its Chip ID?
- * @retval 1 if the ASIC ACKed, 0 otherwise.
- */
-static uint8_t RR2_Bringup(void)
-{
-    return (RR2_IsReady(3u) == HAL_OK) ? 1u : 0u;
-}
-
-/**
  * @brief Digitise one event after a trigger.
  *
  * The ASIC's delay cell has to finish asserting "hold" before the read
@@ -526,6 +639,340 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         g_rr2_sc_error = 1u;
     }
 }
+
+/* ==================================================================
+ * Manual scope walk-through
+ *
+ * Three stages, one per signal, run back to back before the DAQ loop
+ * starts. Each stage puts exactly one signal on the wire and leaves
+ * the others parked, so nothing else can be mistaken for the trace
+ * being measured. The breakpoints that separate them live in main(),
+ * next to the comment that explains the F8 sequence.
+ * ================================================================== */
+#if RR2_MANUAL_DEBUG
+
+/**
+ * @brief Cycle count to nanoseconds, at whatever the PLL actually set.
+ *
+ * SystemCoreClock rather than a hard-coded 216 MHz, so the numbers stay
+ * honest if SystemClock_Config() is ever retuned. Saturates instead of
+ * wrapping, which matters when a frame times out rather than answering.
+ */
+static uint32_t Dbg_CycToNs(uint32_t cycles)
+{
+    const uint32_t mhz = SystemCoreClock / 1000000u;
+
+    if (mhz == 0u)                      return 0u;
+    if (cycles > (0xFFFFFFFFu / 1000u)) return 0xFFFFFFFFu;
+
+    return (cycles * 1000u) / mhz;
+}
+
+/**
+ * @brief TIM1's own clock, which is not the APB2 bus clock.
+ *
+ * Whenever the APB2 prescaler is anything other than 1 the timer clock
+ * is doubled. Here APB2 runs at 108 MHz and TIM1 therefore at 216 MHz,
+ * which is what makes ARR = 107 come out as 2.000 MHz on PE9.
+ */
+static uint32_t Dbg_Tim1ClkHz(void)
+{
+    uint32_t hz = HAL_RCC_GetPCLK2Freq();
+
+    if ((RCC->CFGR & RCC_CFGR_PPRE2) != RCC_CFGR_PPRE2_DIV1) {
+        hz *= 2u;
+    }
+    return hz;
+}
+
+/**
+ * @brief TIM2's own clock. Same doubling rule as TIM1, on APB1.
+ */
+static uint32_t Dbg_Tim2ClkHz(void)
+{
+    uint32_t hz = HAL_RCC_GetPCLK1Freq();
+
+    if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1) {
+        hz *= 2u;
+    }
+    return hz;
+}
+
+/**
+ * @brief A clock that keeps ticking while the debugger holds the core.
+ *
+ * This is what lets a stage notice that you pressed Suspend. SysTick
+ * sits inside the core and stops dead in debug state, so HAL_GetTick()
+ * cannot tell a halt from a fast loop. TIM2 is a peripheral, it is
+ * 32-bit, nothing else in this project uses it, and with its DBGMCU
+ * freeze bit clear it carries on counting through the halt.
+ *
+ * 1 us per tick, so the counter wraps once every ~71 minutes - long
+ * enough that the difference of two readings is always meaningful.
+ */
+static TIM_HandleTypeDef s_dbg_wall;
+
+static void Dbg_WallClock_Init(void)
+{
+    const uint32_t hz = Dbg_Tim2ClkHz();
+
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    __HAL_DBGMCU_UNFREEZE_TIM2();   /* keep counting while halted */
+
+    s_dbg_wall.Instance               = TIM2;
+    s_dbg_wall.Init.Prescaler         = (hz / 1000000u) - 1u;   /* 1 MHz */
+    s_dbg_wall.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    s_dbg_wall.Init.Period            = 0xFFFFFFFFu;
+    s_dbg_wall.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    s_dbg_wall.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_Base_Init(&s_dbg_wall) == HAL_OK) {
+        HAL_TIM_Base_Start(&s_dbg_wall);   /* counter only, no interrupt */
+    }
+}
+
+static uint32_t Dbg_WallClockUs(void)
+{
+    return __HAL_TIM_GET_COUNTER(&s_dbg_wall);
+}
+
+/* Per-stage bookkeeping for the two checks below. */
+static uint32_t s_dbg_limit_ms     = 0u;
+static uint32_t s_dbg_t_start_ms   = 0u;
+static uint32_t s_dbg_last_tick_ms = 0u;
+static uint32_t s_dbg_last_us      = 0u;
+
+/**
+ * @brief Arm the stage: clear the controls and start both clocks.
+ */
+static void Dbg_StageBegin(uint32_t limit_ms)
+{
+    g_dbg_stop        = 0u;
+    g_dbg_exit_reason = 0u;
+
+    s_dbg_limit_ms     = limit_ms;
+    s_dbg_t_start_ms   = HAL_GetTick();
+    s_dbg_last_tick_ms = s_dbg_t_start_ms;
+    s_dbg_last_us      = Dbg_WallClockUs();
+}
+
+/**
+ * @brief Time to leave the stage?
+ *
+ * Three ways out, and g_dbg_exit_reason says which one it was:
+ *
+ *   3  you pressed Suspend. Wall-clock time went by that SysTick never
+ *      saw, which only happens in debug state - so the next F8 walks
+ *      out of the stage and straight into the breakpoint after it.
+ *   2  you set g_dbg_stop from Live Expressions, without halting.
+ *   1  the stage time limit elapsed - 10 s by default, so a stage
+ *      always ends on its own. Zero the limit to run unbounded.
+ */
+static uint8_t Dbg_StageExpired(void)
+{
+    const uint32_t now_ms = HAL_GetTick();
+    const uint32_t now_us = Dbg_WallClockUs();
+
+    /* How much time the CPU lived through, against how much actually
+       passed. They track each other to within loop jitter unless the
+       core was standing still. */
+    const uint32_t ran_ms  = now_ms - s_dbg_last_tick_ms;
+    const uint32_t wall_ms = (now_us - s_dbg_last_us) / 1000u;
+
+    s_dbg_last_tick_ms = now_ms;
+    s_dbg_last_us      = now_us;
+
+    if ((wall_ms > ran_ms) && ((wall_ms - ran_ms) >= RR2_DBG_HALT_MS)) {
+        g_dbg_exit_reason = 3u;
+        return 1u;
+    }
+
+    if (g_dbg_stop) {
+        g_dbg_exit_reason = 2u;
+        return 1u;
+    }
+
+    if (s_dbg_limit_ms == 0u) {
+        return 0u;
+    }
+
+    if ((now_ms - s_dbg_t_start_ms) >= s_dbg_limit_ms) {
+        g_dbg_exit_reason = 1u;
+        return 1u;
+    }
+    return 0u;
+}
+
+/**
+ * @brief Stage 1 - PE9 / CLK_SM_I2C, the ASIC's Slow Control clock.
+ *
+ * Nothing is bit-banged here. TIM1_CH1 drives PE9 in hardware, which is
+ * exactly why this stage comes first: it is the one signal that
+ * survives the breakpoint after it, so it can be studied with the core
+ * halted, and it is the reference the other two are compared against.
+ *
+ * The DBGMCU freeze bits are clear out of reset, but say so explicitly.
+ * A stale freeze left behind by another debug session would stop TIM1
+ * the instant the breakpoint hits, and PE9 would look dead for a reason
+ * that has nothing to do with the board.
+ *
+ * g_dbg_pe9_running is the sanity check worth reading first. TIM1 is an
+ * advanced timer, so a running counter is not enough - the output also
+ * needs its channel enabled and the master output enable set, and a
+ * missing MOE is the classic reason an otherwise correct PWM setup
+ * produces a flat line.
+ *
+ * Note what this stage can and cannot prove: it reads the timer back,
+ * so a green result means the STM32 is emitting the clock. Whether it
+ * arrives at the ASIC pin is a question only the probe can answer.
+ */
+static void RR2_Dbg_Stage1_ClkSmI2c(void)
+{
+    __HAL_DBGMCU_UNFREEZE_TIM1();   /* keep PE9 alive while halted */
+
+    /* The reference that survives a halt, and therefore the thing
+       that lets stages 2 and 3 notice you pressed Suspend. */
+    Dbg_WallClock_Init();
+
+    /* Park the other two signals so the scope sees this one alone.
+       SCL idles high on its own once the bus is quiet. */
+    HAL_GPIO_WritePin(CK_READ_GPIO_Port, CK_READ_Pin, GPIO_PIN_RESET);
+
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+
+    /* What the timer is programmed to emit, straight out of the
+       registers - not what the comments elsewhere claim it emits. */
+    const uint32_t psc = htim1.Instance->PSC + 1u;
+    const uint32_t arr = htim1.Instance->ARR + 1u;
+
+    g_dbg_pe9_hz = ((psc * arr) > 0u) ? (Dbg_Tim1ClkHz() / (psc * arr)) : 0u;
+
+    g_dbg_pe9_running =
+        (((htim1.Instance->CR1  & TIM_CR1_CEN)   != 0u) &&
+         ((htim1.Instance->CCER & TIM_CCER_CC1E) != 0u) &&
+         ((htim1.Instance->BDTR & TIM_BDTR_MOE)  != 0u)) ? 1u : 0u;
+}
+
+/**
+ * @brief Stage 2 - PA1 / CK_READ, the bit-banged readout clock.
+ *
+ * Drives the production RR2_DAQ_ClockOnce() back to back, so what
+ * reaches the scope is the same edge pattern a real event readout
+ * produces rather than a simplified stand-in. The read pointer is
+ * rewound once at the start for a defined beginning and then simply
+ * clocked past the end of the register - this stage is about the shape
+ * of the clock, not about the data being shifted out.
+ *
+ * g_dbg_pa1_period_ns is the number that decides whether the 100 ns
+ * high / 100 ns low in radioroc2_daq.h are achievable at all. At
+ * 216 MHz a 100 ns delay is about 21 cycles, the same order as one
+ * HAL_GPIO_WritePin call, so the measured period usually lands well
+ * above the requested 200 ns.
+ */
+static void RR2_Dbg_Stage2_CkRead(void)
+{
+    Dbg_StageBegin(g_dbg_pa1_ms);
+
+    g_dbg_pa1_pulses = 0u;
+
+    RR2_DAQ_ResetReadPointer();
+
+    while (!Dbg_StageExpired()) {
+        const uint32_t c0 = DWT->CYCCNT;
+
+        for (uint32_t i = 0u; i < RR2_DBG_CKREAD_BLOCK; ++i) {
+            RR2_DAQ_ClockOnce();
+        }
+
+        const uint32_t per_ns =
+            Dbg_CycToNs((DWT->CYCCNT - c0) / RR2_DBG_CKREAD_BLOCK);
+
+        g_dbg_pa1_period_ns = per_ns;
+        g_dbg_pa1_freq_khz  = (per_ns > 0u) ? (1000000u / per_ns) : 0u;
+        g_dbg_pa1_pulses   += RR2_DBG_CKREAD_BLOCK;
+    }
+
+    /* Leave the readout lines exactly as RR2_DAQ_Init() leaves them, so
+       the DAQ can take over later without a stray edge. */
+    HAL_GPIO_WritePin(CK_READ_GPIO_Port,   CK_READ_Pin,   GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RSTN_READ_GPIO_Port, RSTN_READ_Pin, GPIO_PIN_SET);
+    RR2_DAQ_EndOfReadout();
+}
+
+/**
+ * @brief Stage 3 - PB8 / SCL, the Slow Control I2C clock.
+ *
+ * Repeats one harmless single-byte write - R0, the sub-address latch,
+ * with nothing following it - so the bus produces the same short frame
+ * over and over and the picture on the scope stands still.
+ *
+ * g_dbg_ratio_x10 is the point of this stage. The ASIC requires
+ * clk_sm_i2c = 20 x SCL, so 200 is the target and anything below it
+ * means PE9 is too slow for the bus speed and the chip's I2C core
+ * cannot keep up. It is measured against the PE9 frequency captured in
+ * stage 1, which is why this stage runs last.
+ *
+ * The derived SCL reads a few percent low: it comes from timing the HAL
+ * call, which carries some software overhead on top of the wire time.
+ * Treat it as a cross-check on the scope, not a replacement.
+ *
+ * Unlike the CHIPID sweep this stage DOES put a data byte on the wire,
+ * so trigger on SDA falling and read the 9th clock: that ACK bit is the
+ * whole question of whether the ASIC is listening.
+ */
+static void RR2_Dbg_Stage3_Scl(void)
+{
+    Dbg_StageBegin(g_dbg_scl_ms);
+
+    g_dbg_scl_ok     = 0u;
+    g_dbg_scl_fail   = 0u;
+    g_dbg_scl_frames = 0u;
+
+    /* The ASIC's I2C slave core is clocked by PE9. Without it the chip
+       cannot answer, and a perfectly healthy bus would read as dead. */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+
+    while (!Dbg_StageExpired()) {
+        uint8_t value = RR2_COM_SUB_DELAY;
+
+        const uint32_t c0 = DWT->CYCCNT;
+        const HAL_StatusTypeDef st =
+            HAL_I2C_Master_Transmit(&hi2c1, RR2_HAL_ADDR(RR2_REG_ADDR_LSB),
+                                    &value, 1u, RR2_DBG_I2C_TIMEOUT_MS);
+        const uint32_t frame_ns = Dbg_CycToNs(DWT->CYCCNT - c0);
+
+        g_dbg_scl_status = (uint8_t)st;
+        g_dbg_scl_frames++;
+
+        if (st == HAL_OK) {
+            g_dbg_scl_ok++;
+
+            /* Only a frame that ACKed says anything about bus timing. A
+               NACK is mostly HAL timeout, and would drag the derived
+               frequency down to nonsense. */
+            if (frame_ns > 0u) {
+                g_dbg_scl_frame_us = frame_ns / 1000u;
+
+                /* 8 address bits + ACK, then 8 data bits + ACK. START
+                   and STOP are not full clock periods and are left out
+                   - counting them would bias the frequency high. */
+                g_dbg_scl_khz = (18u * 1000000u) / frame_ns;
+
+                if ((g_dbg_scl_khz > 0u) && (g_dbg_pe9_hz > 0u)) {
+                    g_dbg_ratio_x10 =
+                        ((g_dbg_pe9_hz / 1000u) * 10u) / g_dbg_scl_khz;
+                }
+            }
+        } else {
+            g_dbg_scl_fail++;
+        }
+
+        HAL_Delay(RR2_DBG_I2C_GAP_MS);
+    }
+}
+
+#endif /* RR2_MANUAL_DEBUG */
+
 /* USER CODE END 4 */
 
  /* MPU Configuration */
