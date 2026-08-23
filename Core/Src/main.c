@@ -44,7 +44,33 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ---- Experiment window ------------------------------------------
+ * Which channels the readout digitises, and which ones the ASIC is
+ * configured for at boot. Everything outside this window is disabled,
+ * so 60 unconnected inputs stop feeding the NOR trigger.
+ *
+ * The window is deliberately WIDER than the one instrumented channel.
+ * Only RR2_EXP_SIGNAL_CH carries a SiPM; the channels after it are
+ * dark, and their peak-detector codes in the same event are a live
+ * sample of the readout chain's own baseline - trigger, temperature
+ * and all. That is the pedestal, recorded next to every measurement
+ * instead of once in a separate run, which is what lets a thermal
+ * sweep be pedestal-corrected afterwards from its own data.
+ *
+ * The trigger that latched the event came from the signal channel, so
+ * it is uncorrelated with the noise in these three - no selection bias,
+ * unlike a pedestal harvested by lowering the threshold into the noise.
+ * ------------------------------------------------------------------ */
+#define RR2_EXP_SIGNAL_CH   0u   /* the channel with the SiPM on it    */
+#define RR2_EXP_FIRST_CH    0u   /* first channel read out             */
+#define RR2_EXP_NUM_CH      4u   /* signal + 3 dark baseline references */
 
+/* Widening the array later means moving two of these three, and the one
+   left behind is silent: the signal channel simply stops being read and
+   the stream fills with baseline. Make the compiler notice instead.  */
+_Static_assert((RR2_EXP_SIGNAL_CH >= RR2_EXP_FIRST_CH) &&
+               (RR2_EXP_SIGNAL_CH <  RR2_EXP_FIRST_CH + RR2_EXP_NUM_CH),
+               "signal channel sits outside the readout window");
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -98,6 +124,7 @@ static void MPU_Config(void);
 static void RR2_HW_ReleaseResets(void);
 static void RR2_StartClocks(void);
 static uint8_t RR2_Bringup(void);
+static RR2_Status RR2_ApplyExperimentConfig(void);
 static void RR2_ServiceEvent(void);
 static void TMP_Poll(void);
 static void USB_SendStatusPeriodic(void);
@@ -222,6 +249,9 @@ int main(void)
 
         if (g_rr2_cfg_status == RR2_OK) {
             g_rr2_cfg_status = RR2_Ctrl_SetThresholds(300u, 500u, 200u);
+        }
+        if (g_rr2_cfg_status == RR2_OK) {
+            g_rr2_cfg_status = RR2_ApplyExperimentConfig();
         }
         RR2_DAQ_EndOfReadout();
     }
@@ -390,21 +420,60 @@ static uint8_t RR2_Bringup(void)
 }
 
 /**
+ * @brief Put the ASIC into the configuration the experiment runs in.
+ *
+ * Applied at boot rather than left to the operator, because the Slow
+ * Control is volatile: a brown-out during a temperature soak otherwise
+ * brings the chip back with 64 live channels on 20 ns shaping, and it
+ * keeps streaming, and it looks exactly like data. Only uptime_ms going
+ * backwards in the status frame gives it away.
+ *
+ * inDac is deliberately NOT set here. It is the one parameter the sweep
+ * changes per temperature point, so it is left wherever the host put it
+ * last - 0x80 out of the shadow reset.
+ */
+static RR2_Status RR2_ApplyExperimentConfig(void)
+{
+    RR2_Status st;
+
+    /* Silence every channel, then bring back only the window. The 60
+       unconnected inputs are floating, and their discriminators feed
+       the same NOR trigger as the channel that matters.              */
+    st = RR2_Ctrl_SetChannelEnabled(RR2_CH_ALL, 0u);
+    if (st != RR2_OK) return st;
+
+    for (uint8_t c = RR2_EXP_FIRST_CH;
+         c < (uint8_t)(RR2_EXP_FIRST_CH + RR2_EXP_NUM_CH); ++c) {
+        st = RR2_Ctrl_SetChannelEnabled(c, 1u);
+        if (st != RR2_OK) return st;
+    }
+
+    /* Slow shaping, ~1.7 us peaking, hold delay stretched to match.
+       Safe to run after the channel gating: the shaping setters touch
+       only their own bits and leave the enables alone.               */
+    return RR2_Ctrl_PresetCsI();
+}
+
+/**
  * @brief Digitise one event after a trigger.
  *
  * The ASIC's delay cell has to finish asserting "hold" before the read
- * register may be clocked, so wait that out first. A full 64-channel
- * readout takes roughly 64 x 6 us = 400 us, dominated by the ADC.
+ * register may be clocked, so wait that out first - for however long
+ * the currently configured delay needs, which RR2_DAQ_WaitHold() works
+ * out from the shadow.
  *
- * If only a few channels are instrumented, replace RR2_DAQ_ReadEvent
- * with RR2_DAQ_ReadWindow(&g_rr2_event, first_ch, count) - it fast
- * forwards past the unused channels and is far quicker.
+ * Only the experiment window is digitised. All 64 channels would cost
+ * roughly 64 x 6 us = 400 us of dead time and 149 bytes on the wire per
+ * event, against 25 us and 29 bytes for four - and the 60 channels left
+ * out are disabled anyway, so their codes would carry nothing.
  */
 static void RR2_ServiceEvent(void)
 {
     RR2_DAQ_WaitHold();
 
-    g_rr2_read_status = RR2_DAQ_ReadEvent(&g_rr2_event);
+    g_rr2_read_status = RR2_DAQ_ReadWindow(&g_rr2_event,
+                                           RR2_EXP_FIRST_CH,
+                                           RR2_EXP_NUM_CH);
 
     if (g_rr2_read_status == RR2_OK) {
         g_rr2_events_ok++;
