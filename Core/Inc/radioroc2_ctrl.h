@@ -31,6 +31,12 @@
 
 #define RR2_CH_ALL      0xFFu   /* broadcast sentinel for the ch argument */
 
+/* Sentinel for the hg half of the paired setters below: leave that field
+   at whatever the shadow already holds. The host passes it whenever the
+   hg argument is omitted, so a control that is no longer offered cannot
+   silently rewrite the HG chain behind the back of the operator.      */
+#define RR2_KEEP        0xFFu
+
 /* ------------------------------------------------------------------ */
 /* Shadow image                                                        */
 /* ------------------------------------------------------------------ */
@@ -84,15 +90,19 @@ const RR2_Shadow *RR2_Ctrl_GetShadow(void);
  *  this is the knob for equalising gain across an array.             */
 RR2_Status RR2_Ctrl_SetInDac(uint8_t ch, uint8_t value);
 
-/** Charge preamp gains. lg 0..15 (span 0.5-8), hg 0..15 (span 5-80). */
+/** Charge preamp gains. lg 0..15 (span 0.5-8), hg 0..15 (span 5-80).
+ *  Only the LG path is digitised - see the note on SetAnalogMux - so hg
+ *  is kept for the charge trigger, which still runs off the HG chain.
+ *  Pass RR2_KEEP for either half to leave it exactly as it is.       */
 RR2_Status RR2_Ctrl_SetChargeGain(uint8_t ch, uint8_t lg, uint8_t hg);
 
-/** Shaper peaking time index, 0..15 for each gain path.
+/** Shaper peaking time index, 0..15 for each gain path, or RR2_KEEP.
  *  Step is 20 ns normally, 120 ns when slow shaping is enabled.      */
 RR2_Status RR2_Ctrl_SetShapingTime(uint8_t ch, uint8_t tau_lg, uint8_t tau_hg);
 
 /** Slow shaping toggles. 0 -> 20 ns steps (max 300 ns),
- *  1 -> 120 ns steps (max 1.8 us). Needed for slow scintillators.    */
+ *  1 -> 120 ns steps (max 1.8 us), RR2_KEEP -> unchanged. Needed for
+ *  slow scintillators.                                               */
 RR2_Status RR2_Ctrl_SetSlowShaping(uint8_t ch, uint8_t slow_lg, uint8_t slow_hg);
 
 /** Time preamp gain, 0..63 (closed-loop gain 15..100).               */
@@ -131,9 +141,13 @@ RR2_Status RR2_Ctrl_SetTriggerSource(uint8_t sel_trig);
 /** Hold source: 0 = internal delay cell, 1 = external HOLDEXT pin.   */
 RR2_Status RR2_Ctrl_SetHoldExternal(uint8_t external);
 
-/** Power the analog multiplexer buffers. Both must be on or the ADC
- *  reads nothing from OUT_AMUXHG / OUT_AMUXLG.                       */
-RR2_Status RR2_Ctrl_SetAnalogMux(uint8_t enable_hg, uint8_t enable_lg);
+/** Power the LG analog multiplexer buffer. It must be on or the ADC
+ *  reads nothing from OUT_AMUXLG.
+ *
+ *  There is no HG argument on purpose: OUT_AMUXHG goes nowhere on this
+ *  board, so its buffer is always written off. The HG chain inside the
+ *  ASIC stays powered - the charge trigger is derived from it.       */
+RR2_Status RR2_Ctrl_SetAnalogMux(uint8_t enable);
 
 /* ------------------------------------------------------------------ */
 /* Convenience preset                                                  */

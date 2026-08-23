@@ -185,18 +185,17 @@ class Link:
             for _ in range(n):
                 seq += 1
                 if random.random() < 0.72:
-                    hg = random.gauss(self._sim_state["centre"],
+                    lg = random.gauss(self._sim_state["centre"],
                                       self._sim_state["sigma"])
                 else:
-                    hg = random.expovariate(1 / 700.0)      # Compton-ish tail
-                hg = int(max(0, min(ADC_MAX, hg)))
-                lg = int(hg * 0.22)
+                    lg = random.expovariate(1 / 700.0)      # Compton-ish tail
+                lg = int(max(0, min(ADC_MAX, lg)))
                 self.frames.put({
                     "type": "event", "seq": seq,
                     "t_ms": int((now - t0) * 1000),
                     "temp_c": 24.8 + 0.4 * random.random(),
                     "first_ch": 0, "count": 1,
-                    "hg": [hg], "lg": [lg],
+                    "lg": [lg],
                 })
             if now >= next_status:
                 next_status = now + 1.0
@@ -249,104 +248,6 @@ class Histogram:
 
     def centre_of(self, idx):
         return self.lo + (idx + 0.5) * self.width
-
-
-# ===================================================================
-#  Cross-calibration between the two gain paths
-# ===================================================================
-class GainCalib:
-    """Reconstruct one energy scale from the HG and LG readings.
-
-    HG and LG are two measurements of the SAME charge at different
-    amplification, so adding them is meaningless. Instead the LG reading
-    is rescaled into HG-equivalent units with a straight line fitted over
-    the region where both paths are valid, and every event is taken from
-    whichever path is still in range:
-
-        E = HG                      while HG is below saturation
-        E = a * LG + b              once HG has saturated
-
-    That keeps HG resolution at low energy and LG headroom at high
-    energy, on a single continuous axis.
-    """
-
-    def __init__(self):
-        self.a = 0.0          # slope: HG counts per LG count
-        self.b = 0.0          # offset
-        self.sat = 3900       # HG treated as saturated at or above this
-        self.lg_min = 150     # ignore LG samples sitting in the baseline
-        self.valid = False
-        self.n_fit = 0
-        self.r2 = 0.0
-        self.points = []      # (lg, hg) pairs kept for fitting
-        self.max_points = 20000
-        self.capped = False
-
-    # -- data collection
-    def add_pair(self, lg, hg):
-        if len(self.points) < self.max_points:
-            self.points.append((lg, hg))
-        else:
-            self.capped = True
-
-    def clear(self):
-        self.points.clear()
-        self.valid = False
-        self.n_fit = 0
-        self.r2 = 0.0
-        self.capped = False
-
-    # -- fitting
-    def fit(self):
-        """Least squares HG = a*LG + b over the overlap region."""
-        pts = [(lg, hg) for lg, hg in self.points
-               if hg < self.sat and lg >= self.lg_min]
-        n = len(pts)
-        self.n_fit = n
-        if n < 20:
-            self.valid = False
-            return False
-
-        sx = sum(p[0] for p in pts)
-        sy = sum(p[1] for p in pts)
-        sxx = sum(p[0] * p[0] for p in pts)
-        sxy = sum(p[0] * p[1] for p in pts)
-        den = n * sxx - sx * sx
-        if abs(den) < 1e-9:
-            self.valid = False
-            return False
-
-        self.a = (n * sxy - sx * sy) / den
-        self.b = (sy - self.a * sx) / n
-
-        mean = sy / n
-        ss_tot = sum((p[1] - mean) ** 2 for p in pts)
-        ss_res = sum((p[1] - (self.a * p[0] + self.b)) ** 2 for p in pts)
-        self.r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-
-        # A negative or absurd slope means the overlap region was never
-        # populated - refuse it rather than produce a nonsense spectrum.
-        self.valid = 0.5 < self.a < 200.0
-        return self.valid
-
-    def set_manual(self, a, b):
-        self.a = float(a)
-        self.b = float(b)
-        self.valid = self.a > 0
-        self.r2 = 0.0
-        self.n_fit = 0
-        return self.valid
-
-    # -- use
-    def combined(self, hg, lg):
-        """One value on the HG-equivalent scale."""
-        if hg < self.sat:
-            return float(hg)
-        return self.a * lg + self.b
-
-    def full_scale(self):
-        """Top of the combined axis, in HG-equivalent units."""
-        return max(ADC_MAX, int(self.a * ADC_MAX + self.b))
 
 
 # ===================================================================
@@ -531,9 +432,8 @@ def export_measurement(rec, path):
     if not HAVE_XLSX or path.lower().endswith(".csv"):
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            for k in ("started", "duration_s", "channel", "gain",
-                      "total", "overflow", "temp_c", "note",
-                      "calib_a", "calib_b", "calib_r2", "hg_saturation"):
+            for k in ("started", "duration_s", "channel", "source",
+                      "total", "overflow", "temp_c", "note"):
                 w.writerow([k, rec.get(k, "")])
             w.writerow([])
             w.writerow(["bin", "adc_low", "adc_high", "adc_centre", "counts"])
@@ -551,7 +451,7 @@ def export_measurement(rec, path):
                    round(lo + (i + 0.5) * width, 2), c])
 
     chart = LineChart()
-    chart.title = f"Spectrum - ch{rec.get('channel')} {rec.get('gain')}"
+    chart.title = f"Spectrum - ch{rec.get('channel')} OUT_AMUXLG"
     chart.y_axis.title = "counts"
     chart.x_axis.title = "ADC channel"
     chart.height, chart.width = 10, 22
@@ -562,15 +462,11 @@ def export_measurement(rec, path):
     ws.add_chart(chart, "G2")
 
     meta = wb.create_sheet("Metadata")
-    for k in ("started", "duration_s", "channel", "gain", "bins", "lo", "hi",
-              "total", "overflow", "temp_c", "rate_cps", "note", "settings",
-              "calib_a", "calib_b", "calib_r2", "calib_n", "hg_saturation"):
+    for k in ("started", "duration_s", "channel", "source", "bins", "lo", "hi",
+              "total", "overflow", "temp_c", "rate_cps", "note", "settings"):
         meta.append([k, str(rec.get(k, ""))])
-    if rec.get("gain") == "HG+LG":
-        meta.append([])
-        meta.append(["axis", "HG-equivalent ADC counts"])
-        meta.append(["reconstruction", "E = HG below saturation, "
-                                       "E = calib_a * LG + calib_b above"])
+    meta.append([])
+    meta.append(["axis", "raw ADC counts on OUT_AMUXLG"])
 
     wb.save(path)
 
@@ -721,17 +617,12 @@ class PageSettings(Page):
 
         self.v_indac = self._spin(ch, "inDac (0-255)", 0, 255, 128, r := r + 1)
         self.v_glg = self._spin(ch, "lgGain (0-15)", 0, 15, 4, r := r + 1)
-        self.v_ghg = self._spin(ch, "hgGain (0-15)", 0, 15, 4, r := r + 1)
         self.v_tlg = self._spin(ch, "tauLG (0-15)", 0, 15, 14, r := r + 1)
-        self.v_thg = self._spin(ch, "tauHG (0-15)", 0, 15, 14, r := r + 1)
 
         r += 1
         self.v_slg = tk.IntVar(value=1)
-        self.v_shg = tk.IntVar(value=1)
         ttk.Checkbutton(ch, text="slow shaping LG", variable=self.v_slg)\
-            .grid(row=r, column=0, sticky="w", pady=3)
-        ttk.Checkbutton(ch, text="slow shaping HG", variable=self.v_shg)\
-            .grid(row=r, column=1, sticky="w", pady=3)
+            .grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
 
         self.v_pat = self._spin(ch, "patGain (0-63)", 0, 63, 32, r := r + 1)
         self.v_t1 = self._spin(ch, "trim T1 (0-63)", 0, 63, 0, r := r + 1)
@@ -767,12 +658,10 @@ class PageSettings(Page):
             .grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
 
         r += 1
-        self.v_mhg = tk.IntVar(value=1)
         self.v_mlg = tk.IntVar(value=1)
-        ttk.Checkbutton(gl, text="AMUX HG buffer", variable=self.v_mhg)\
-            .grid(row=r, column=0, sticky="w", pady=3)
-        ttk.Checkbutton(gl, text="AMUX LG buffer", variable=self.v_mlg)\
-            .grid(row=r, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(gl, text="AMUX LG buffer (the readout path)",
+                        variable=self.v_mlg)\
+            .grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
 
         r += 1
         gbar = ttk.Frame(gl)
@@ -834,9 +723,11 @@ class PageSettings(Page):
     def apply_channel(self):
         c = self.v_ch.get()
         self.cmd(f"ch {c} indac {self.v_indac.get()}")
-        self.cmd(f"ch {c} gain {self.v_glg.get()} {self.v_ghg.get()}")
-        self.cmd(f"ch {c} slow {self.v_slg.get()} {self.v_shg.get()}")
-        self.cmd(f"ch {c} tau {self.v_tlg.get()} {self.v_thg.get()}")
+        # One argument each: the firmware leaves the HG half of these
+        # registers untouched when it is omitted.
+        self.cmd(f"ch {c} gain {self.v_glg.get()}")
+        self.cmd(f"ch {c} slow {self.v_slg.get()}")
+        self.cmd(f"ch {c} tau {self.v_tlg.get()}")
         self.cmd(f"ch {c} patgain {self.v_pat.get()}")
         self.cmd(f"ch {c} trim {self.v_t1.get()} {self.v_t2.get()}")
 
@@ -855,13 +746,13 @@ class PageSettings(Page):
         self.cmd(f"delay {self.v_dly.get()} {self.v_slp.get()}")
         self.cmd(f"trig {self.v_trig.get()}")
         self.cmd(f"hold {'ext' if self.v_hold_ext.get() else 'int'}")
-        self.cmd(f"mux {self.v_mhg.get()} {self.v_mlg.get()}")
+        self.cmd(f"mux {self.v_mlg.get()}")
 
     def preset_csi(self):
         self.cmd("preset csi")
         # Mirror what the firmware preset does, so the form stays honest.
-        self.v_slg.set(1); self.v_shg.set(1)
-        self.v_tlg.set(14); self.v_thg.set(14)
+        self.v_slg.set(1)
+        self.v_tlg.set(14)
         self.v_dly.set(255); self.v_slp.set(15)
 
     def on_show(self):
@@ -888,55 +779,22 @@ class PageMeasure(Page):
         ttk.Spinbox(ctl, from_=0, to=63, textvariable=self.v_ch, width=6)\
             .grid(row=0, column=1, padx=(6, 18))
 
-        ttk.Label(ctl, text="Gain").grid(row=0, column=2, sticky="w")
-        self.v_gain = tk.StringVar(value="HG")
-        ttk.Combobox(ctl, textvariable=self.v_gain, width=9, state="readonly",
-                     values=["HG", "LG", "HG+LG"])\
-            .grid(row=0, column=3, padx=(6, 18))
-
-        ttk.Label(ctl, text="Bins").grid(row=0, column=4, sticky="w")
+        ttk.Label(ctl, text="Bins").grid(row=0, column=2, sticky="w")
         self.v_bins = tk.IntVar(value=512)
         ttk.Combobox(ctl, textvariable=self.v_bins, width=7, state="readonly",
                      values=[128, 256, 512, 1024, 2048])\
-            .grid(row=0, column=5, padx=(6, 18))
+            .grid(row=0, column=3, padx=(6, 18))
 
         ttk.Label(ctl, text="Duration (s, 0 = manual)")\
-            .grid(row=0, column=6, sticky="w")
+            .grid(row=0, column=4, sticky="w")
         self.v_dur = tk.IntVar(value=60)
         ttk.Spinbox(ctl, from_=0, to=36000, textvariable=self.v_dur, width=8)\
-            .grid(row=0, column=7, padx=6)
+            .grid(row=0, column=5, padx=6)
 
-        # ---- HG+LG cross-calibration -------------------------------
-        cal = ttk.LabelFrame(self, text="HG+LG cross-calibration", padding=12)
-        cal.pack(fill="x", pady=(0, 8))
-
-        ttk.Label(cal, text="HG-equivalent  =  a x LG + b").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-        ttk.Label(cal, text="a").grid(row=1, column=0, sticky="e")
-        self.v_a = tk.StringVar(value="0.000")
-        ttk.Entry(cal, textvariable=self.v_a, width=10)\
-            .grid(row=1, column=1, padx=(4, 14))
-
-        ttk.Label(cal, text="b").grid(row=1, column=2, sticky="e")
-        self.v_b = tk.StringVar(value="0.0")
-        ttk.Entry(cal, textvariable=self.v_b, width=10)\
-            .grid(row=1, column=3, padx=(4, 14))
-
-        ttk.Label(cal, text="HG saturates at").grid(row=1, column=4, sticky="e")
-        self.v_sat = tk.IntVar(value=3900)
-        ttk.Spinbox(cal, from_=1000, to=4095, textvariable=self.v_sat, width=7)\
-            .grid(row=1, column=5, padx=(4, 14))
-
-        ttk.Button(cal, text="Auto-calibrate", style="Accent.TButton",
-                   command=self.auto_calibrate).grid(row=1, column=6, padx=4)
-        ttk.Button(cal, text="Apply manual", command=self.apply_manual)\
-            .grid(row=1, column=7, padx=4)
-        ttk.Button(cal, text="Clear pairs", command=self.clear_pairs)\
-            .grid(row=1, column=8, padx=4)
-
-        self.lbl_cal = ttk.Label(cal, text="not calibrated", style="Bad.TLabel")
-        self.lbl_cal.grid(row=2, column=0, columnspan=9, sticky="w", pady=(8, 0))
+        # There is one signal to histogram, so there is nothing to choose.
+        ttk.Label(ctl, text="source: OUT_AMUXLG (low gain)",
+                  style="Sub.TLabel")\
+            .grid(row=0, column=6, sticky="w", padx=(18, 0))
 
         bar = ttk.Frame(self)
         bar.pack(fill="x")
@@ -964,25 +822,17 @@ class PageMeasure(Page):
 
         self.hist = Histogram()
         self.canvas.set_hist(self.hist)
-        self.calib = GainCalib()
         self.running = False
         self.t_start = None
         self.last_temp = 0.0
         self._last_ui = 0.0
 
     # -- control
-    def _axis_top(self):
-        """Upper edge of the histogram axis for the selected mode."""
-        if self.v_gain.get() == "HG+LG" and self.calib.valid:
-            return self.calib.full_scale()
-        return ADC_MAX
-
     def start(self):
         if not self.app.link.connected:
             messagebox.showwarning("Offline", "Connect to the board first.")
             return
-        self.calib.sat = self.v_sat.get()
-        self.hist.reset(self.v_bins.get(), 0, self._axis_top())
+        self.hist.reset(self.v_bins.get(), 0, ADC_MAX)
         self.canvas.set_hist(self.hist)
         self.running = True
         self.t_start = time.time()
@@ -999,70 +849,6 @@ class PageMeasure(Page):
         self.canvas.redraw()
         self.lbl.configure(text="cleared")
 
-    # -- cross-calibration
-    def _show_cal(self):
-        if self.calib.valid:
-            extra = f", R2 {self.calib.r2:.4f}" if self.calib.n_fit else " (manual)"
-            capped = "  [pair buffer full]" if self.calib.capped else ""
-            self.lbl_cal.configure(
-                style="Ok.TLabel",
-                text=f"calibrated: a = {self.calib.a:.4f}, b = {self.calib.b:.1f}"
-                     f"  |  {self.calib.n_fit} points{extra}"
-                     f"  |  full scale {self.calib.full_scale()} HG-equivalent{capped}")
-        else:
-            self.lbl_cal.configure(
-                style="Bad.TLabel",
-                text=f"not calibrated - {len(self.calib.points)} pairs collected, "
-                     f"{self.calib.n_fit} usable in the overlap region")
-        self.v_a.set(f"{self.calib.a:.4f}")
-        self.v_b.set(f"{self.calib.b:.1f}")
-
-    def auto_calibrate(self):
-        self.calib.sat = self.v_sat.get()
-        if not self.calib.fit():
-            self._show_cal()
-            messagebox.showwarning(
-                "Not enough overlap",
-                "The fit needs at least 20 events where HG is below "
-                "saturation and LG is above its baseline.\n\n"
-                "Acquire in HG+LG mode with a source that produces both "
-                "small and large pulses, then try again.")
-            return
-        self.rebuild_from_pairs()
-        self._show_cal()
-
-    def apply_manual(self):
-        try:
-            a = float(self.v_a.get())
-            b = float(self.v_b.get())
-        except ValueError:
-            messagebox.showerror("Bad value", "a and b must be numbers.")
-            return
-        self.calib.sat = self.v_sat.get()
-        if not self.calib.set_manual(a, b):
-            messagebox.showerror("Bad value", "a must be positive.")
-            return
-        self.rebuild_from_pairs()
-        self._show_cal()
-
-    def clear_pairs(self):
-        self.calib.clear()
-        self._show_cal()
-
-    def rebuild_from_pairs(self):
-        """Re-fill the histogram from the stored pairs.
-
-        Needed because the calibration usually arrives after the data:
-        the spectrum has to be recomputed on the new energy scale.
-        """
-        if not self.calib.valid or not self.calib.points:
-            return
-        self.hist.reset(self.v_bins.get(), 0, self.calib.full_scale())
-        for lg, hg in self.calib.points:
-            self.hist.add(self.calib.combined(hg, lg))
-        self.canvas.set_hist(self.hist)
-        self.canvas.redraw()
-
     def feed(self, frame):
         """Called by the app pump for every decoded frame."""
         if frame["type"] == "status":
@@ -1076,20 +862,7 @@ class PageMeasure(Page):
         if idx < 0 or idx >= frame["count"]:
             return
 
-        hg = frame["hg"][idx]
-        lg = frame["lg"][idx]
-        mode = self.v_gain.get()
-
-        if mode == "HG":
-            self.hist.add(hg)
-        elif mode == "LG":
-            self.hist.add(lg)
-        else:
-            # Keep every pair so a calibration can be fitted from data
-            # already taken, then histogram only once it is trustworthy.
-            self.calib.add_pair(lg, hg)
-            if self.calib.valid:
-                self.hist.add(self.calib.combined(hg, lg))
+        self.hist.add(frame["lg"][idx])
 
     def tick(self):
         if not self.running:
@@ -1109,31 +882,21 @@ class PageMeasure(Page):
             rate = self.hist.total / elapsed if elapsed > 0 else 0
             pk = self.hist.peak_bin()
             pk_txt = f"peak ADC {self.hist.centre_of(pk):.0f}" if pk is not None else "-"
-            extra = ""
-            if self.v_gain.get() == "HG+LG" and not self.calib.valid:
-                extra = (f" | COLLECTING PAIRS ({len(self.calib.points)}) - "
-                         f"press Auto-calibrate")
             self.lbl.configure(
                 text=f"running {elapsed:6.1f} s | {self.hist.total} counts | "
                      f"{rate:6.1f} cps | {pk_txt} | T {self.last_temp:.1f} C | "
-                     f"overflow {self.hist.overflow}{extra}")
+                     f"overflow {self.hist.overflow}")
 
     def save(self):
         if self.hist.total == 0:
             messagebox.showinfo("Nothing to save", "Acquire some data first.")
-            return
-        if self.v_gain.get() == "HG+LG" and not self.calib.valid:
-            messagebox.showwarning(
-                "Not calibrated",
-                "A combined spectrum needs a calibration before it means "
-                "anything. Press Auto-calibrate first.")
             return
         elapsed = (time.time() - self.t_start) if self.t_start else 0.0
         rec = {
             "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "duration_s": round(elapsed, 1),
             "channel": self.v_ch.get(),
-            "gain": self.v_gain.get(),
+            "source": "OUT_AMUXLG",
             "bins": self.hist.bins,
             "lo": self.hist.lo,
             "hi": self.hist.hi,
@@ -1144,13 +907,6 @@ class PageMeasure(Page):
             "rate_cps": round(self.hist.total / elapsed, 2) if elapsed else 0,
             "note": "simulator" if self.app.link.sim else "",
             "settings": "",
-            # Without these the combined spectrum cannot be interpreted
-            # later, since its x axis is in HG-equivalent units.
-            "calib_a": round(self.calib.a, 6) if self.v_gain.get() == "HG+LG" else "",
-            "calib_b": round(self.calib.b, 3) if self.v_gain.get() == "HG+LG" else "",
-            "calib_r2": round(self.calib.r2, 6) if self.v_gain.get() == "HG+LG" else "",
-            "calib_n": self.calib.n_fit if self.v_gain.get() == "HG+LG" else "",
-            "hg_saturation": self.calib.sat if self.v_gain.get() == "HG+LG" else "",
         }
         save_measurement(rec)
         messagebox.showinfo("Saved", "Measurement stored in History.")
@@ -1169,10 +925,10 @@ class PageHistory(Page):
             .pack(side="left", padx=12)
         ttk.Button(top, text="Refresh", command=self.reload).pack(side="right")
 
-        cols = ("started", "duration_s", "channel", "gain", "total",
-                "rate_cps", "temp_c", "calib_a")
+        cols = ("started", "duration_s", "channel", "total",
+                "rate_cps", "temp_c", "overflow")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=7)
-        widths = (160, 80, 70, 70, 90, 90, 80, 90)
+        widths = (170, 90, 80, 100, 100, 90, 90)
         for c, w in zip(cols, widths):
             self.tree.heading(c, text=c.replace("_", " "))
             self.tree.column(c, width=w, anchor="center")
@@ -1201,9 +957,9 @@ class PageHistory(Page):
         for i, r in enumerate(self.records):
             self.tree.insert("", "end", iid=str(i), values=(
                 r.get("started", ""), r.get("duration_s", ""),
-                r.get("channel", ""), r.get("gain", ""),
-                r.get("total", ""), r.get("rate_cps", ""), r.get("temp_c", ""),
-                r.get("calib_a", "")))
+                r.get("channel", ""), r.get("total", ""),
+                r.get("rate_cps", ""), r.get("temp_c", ""),
+                r.get("overflow", "")))
         self.canvas.set_hist(None)
         self.lbl.configure(
             text="" if HAVE_XLSX else "openpyxl not installed - export falls back to CSV")
@@ -1288,48 +1044,34 @@ ORDER OF OPERATIONS
          too high and you lose the low energy part of the spectrum.
 
     3. Measure
-       Choose the channel and gain path, set the bin count and a
-       duration, then Start. The spectrum builds up live. Save
-       Measurement when it looks reasonable.
+       Choose the channel, set the bin count and a duration, then
+       Start. The spectrum builds up live. Save Measurement when it
+       looks reasonable.
 
     4. History
        The six most recent measurements are kept. Select one to preview
        it, then Export to Excel.
 
-HIGH GAIN, LOW GAIN, OR BOTH
-    HG has more resolution but saturates earlier; LG covers the full
-    dynamic range with coarser steps. Start with HG for low energy
-    sources and switch to LG if the peak runs into the top of the ADC
-    range.
+WHICH SIGNAL IS MEASURED
+    Only OUT_AMUXLG is wired to an ADC, so every spectrum here is the
+    low gain path: one ADC code per channel per event, and the x axis is
+    raw ADC counts. There is no gain choice to make and nothing to
+    cross-calibrate.
 
-    HG+LG combines the two into one continuous energy scale. Note that
-    this is NOT an addition: both paths measure the same charge at
-    different amplification, so adding them would be meaningless. What
-    happens instead is a gain switch:
+    lgGain is therefore the knob for pulse height. If the photopeak sits
+    in the top bin the path is saturating - lower lgGain, or lower the
+    SiPM overvoltage with inDac. If the whole spectrum is squeezed into
+    the first few bins, raise lgGain.
 
-        E = HG                        while HG is below saturation
-        E = a x LG + b                once HG has saturated
+    The ASIC still has a high gain chain and the charge trigger is
+    derived from it, but nothing digitises it: its output pad,
+    OUT_AMUXHG, is not connected and its mux buffer is written off. So
+    it has no controls on the Settings page, and applying a channel
+    leaves its registers exactly as they were. If you ever do need it,
+    the console still takes the second argument:
 
-    The line a, b is fitted over the overlap region, where HG is still
-    in range and LG is already above its baseline. The result carries HG
-    resolution at low energy and LG headroom at high energy, on one axis
-    expressed in HG-equivalent counts.
-
-HOW TO CALIBRATE HG+LG
-    1. Select HG+LG and run a short acquisition, ideally with a source
-       that produces both small and large pulses. Nothing is histogrammed
-       yet - the software is collecting (LG, HG) pairs.
-    2. Press Auto-calibrate. The fit needs at least 20 events inside the
-       overlap region. The spectrum is then rebuilt on the new scale.
-    3. Check R2 in the status line. Above about 0.99 is healthy; a low
-       value usually means the overlap region was never populated, so
-       either lower the threshold or use a stronger source.
-    4. Once a and b look stable you can type them in by hand on later
-       runs with Apply manual, as long as the gain settings have not
-       changed.
-
-    The calibration is stored with every saved measurement, because
-    without a and b the combined x axis cannot be interpreted later.
+        ch 0 gain 4 6          lgGain 4, hgGain 6
+        ch 0 gain 4            lgGain 4, HG untouched
 
 TUNING THE HOLD DELAY
     The peak detector is sampled after a programmable delay. If that
@@ -1352,12 +1094,12 @@ TEMPERATURE
 
 TROUBLESHOOTING
     No events at all
-        Check that the channel is enabled, that the AMUX buffers are
+        Check that the channel is enabled, that the LG AMUX buffer is
         on, and that the threshold is not far above the pulse height.
     Enormous count rate
         The threshold is in the noise. Raise DAC1.
     Peak sitting at the very top bin
-        The ADC is saturating. Switch to LG, or lower hgGain.
+        The ADC is saturating. Lower lgGain, or lower inDac.
     Dropped frames in the status line
         The USB link cannot keep up. Reduce the number of enabled
         channels or the event rate.

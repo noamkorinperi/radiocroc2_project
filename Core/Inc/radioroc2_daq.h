@@ -11,15 +11,20 @@
  *      detectors. Wait out that delay before touching CK_READ.
  *   3. Pulse RSTN_READ low to reset the read pointer.
  *   4. Each RISING edge of CK_READ advances the read register by one
- *      channel; OUT_AMUXHG / OUT_AMUXLG then present that channel's
- *      peak value. Allow >200 ns of settling before sampling.
+ *      channel; OUT_AMUXLG then presents that channel's peak value.
+ *      Allow >200 ns of settling before sampling.
  *   5. After channel 63, pulse RESET_N (>20 ns) to clear the peak
  *      detectors and the delay cell, arming the ASIC for the next event.
  *
  * IMPORTANT - CK_READ must be BURST generated, not free-running.
  * A continuously running PWM on CK_READ would keep shifting the read
  * pointer between events, so PA1 is driven as GPIO_Output and pulsed
- * in software. See PROJECT_DOCUMENTATION section 3 for the rationale.
+ * in software.
+ *
+ * ONE GAIN - only OUT_AMUXLG is instrumented on this board. It lands on
+ * PA5 / ADC2_IN5; OUT_AMUXHG is not wired anywhere, and its mux buffer
+ * is powered down in Slow Control (EN_aMuxHG = 0). So an event carries
+ * exactly one code per channel, all the way out to the host.
  ******************************************************************************
  */
 #ifndef RADIOROC2_DAQ_H
@@ -44,9 +49,8 @@
 /* One captured event                                                  */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    uint16_t hg[RR2_NUM_CHANNELS];  /* High Gain peak, ADC1_IN4 counts */
-    uint16_t lg[RR2_NUM_CHANNELS];  /* Low  Gain peak, ADC2_IN5 counts */
-    uint8_t  first_ch;              /* first channel stored in hg/lg   */
+    uint16_t lg[RR2_NUM_CHANNELS];  /* OUT_AMUXLG peak, ADC2_IN5 counts */
+    uint8_t  first_ch;              /* first channel stored in lg      */
     uint8_t  count;                 /* how many channels are valid     */
     uint32_t seq;                   /* trigger sequence number         */
 } RR2_Event;
@@ -55,9 +59,9 @@ typedef struct {
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 
-/** Bind the ADCs and enable the DWT cycle counter used for ns delays.
- *  Call once after MX_ADC1_Init() / MX_ADC2_Init().                   */
-void RR2_DAQ_Init(ADC_HandleTypeDef *adc_hg, ADC_HandleTypeDef *adc_lg);
+/** Bind the ADC and enable the DWT cycle counter used for ns delays.
+ *  Call once after MX_ADC2_Init().                                    */
+void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg);
 
 /** 1 if the DWT cycle counter is running and delays are cycle-accurate,
  *  0 if the driver fell back to a coarse software loop. Check this once
@@ -86,8 +90,8 @@ RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt);
  *  known sub-range is instrumented (Example 1 "fast forward").        */
 RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count);
 
-/** Sample both gains once, without touching CK_READ. Useful to probe
+/** Sample OUT_AMUXLG once, without touching CK_READ. Useful to probe
  *  a single channel or to check the analog path during bring-up.      */
-RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg);
+RR2_Status RR2_DAQ_SampleLG(uint16_t *lg);
 
 #endif /* RADIOROC2_DAQ_H */

@@ -42,10 +42,12 @@
    nominal and nothing is concluded from them. What the bus actually
    does is settled by whether the ASIC answers, which is the entire
    point of this file.                                                */
-#define CLK_ARR_FAST      107u
+/* Only the slow pair is ever programmed. Pass 1's values are not named
+   here because they are never written - RR2_I2CTest_Run() saves the
+   live ARR and TIMINGR on the way in and restores those on the way out,
+   so whatever the board booted with is what pass 1 measures and what
+   the hardware is left holding. */
 #define CLK_ARR_SLOW      1079u
-
-#define TIMINGR_FAST      0x20404768u
 #define TIMINGR_SLOW      0xB040C7F9u
 
 /* How many times the round trip is repeated per pass. One success can

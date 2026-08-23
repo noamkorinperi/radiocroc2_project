@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    usb_cmd.c
- * @brief   Line-based command interface over USB CDC.
+ * @brief   Line-based command interface over the host link.
  * @note    See usb_cmd.h for the command set.
  ******************************************************************************
  */
@@ -87,9 +87,9 @@ static void cmd_help(void)
     reply("commands:\r\n");
     reply("  stat | fmt bin|txt | defaults | push\r\n");
     reply("  ch <n|all> indac <0-255>\r\n");
-    reply("  ch <n|all> gain <lg> <hg>      (0-15)\r\n");
-    reply("  ch <n|all> tau <lg> <hg>       (0-15)\r\n");
-    reply("  ch <n|all> slow <lg> <hg>      (0|1)\r\n");
+    reply("  ch <n|all> gain <lg> [hg]      (0-15)\r\n");
+    reply("  ch <n|all> tau <lg> [hg]       (0-15)\r\n");
+    reply("  ch <n|all> slow <lg> [hg]      (0|1)\r\n");
     reply("  ch <n|all> patgain <0-63>\r\n");
     reply("  ch <n|all> trim <t1> <t2>      (0-63)\r\n");
     reply("  ch <n|all> on|off\r\n");
@@ -97,7 +97,7 @@ static void cmd_help(void)
     reply("  ch <n> dump\r\n");
     reply("  th <dac1> <dac2> <dacq>        (0-1023)\r\n");
     reply("  delay <0-255> <slope 0-15>\r\n");
-    reply("  trig <0-15> | hold int|ext | mux <hg> <lg>\r\n");
+    reply("  trig <0-15> | hold int|ext | mux <0|1>  (LG buffer)\r\n");
     reply("  preset csi\r\n");
     reply("  w <addr> <sub> <data> | r <addr> <sub>\r\n");
     reply("  i2ctest                        Slow Control link test\r\n");
@@ -145,14 +145,15 @@ static void cmd_ch(void)
     if (arg_is(2u, "indac")) {
         reply_status(RR2_Ctrl_SetInDac(ch, (uint8_t)arg_i(3u, 128)));
     } else if (arg_is(2u, "gain")) {
+        /* No hg argument -> RR2_KEEP -> the HG nibble is left alone. */
         reply_status(RR2_Ctrl_SetChargeGain(ch, (uint8_t)arg_i(3u, 4),
-                                                (uint8_t)arg_i(4u, 4)));
+                                                (uint8_t)arg_i(4u, RR2_KEEP)));
     } else if (arg_is(2u, "tau")) {
         reply_status(RR2_Ctrl_SetShapingTime(ch, (uint8_t)arg_i(3u, 1),
-                                                 (uint8_t)arg_i(4u, 1)));
+                                                 (uint8_t)arg_i(4u, RR2_KEEP)));
     } else if (arg_is(2u, "slow")) {
         reply_status(RR2_Ctrl_SetSlowShaping(ch, (uint8_t)arg_i(3u, 0),
-                                                 (uint8_t)arg_i(4u, 0)));
+                                                 (uint8_t)arg_i(4u, RR2_KEEP)));
     } else if (arg_is(2u, "patgain")) {
         reply_status(RR2_Ctrl_SetPatGain(ch, (uint8_t)arg_i(3u, 32)));
     } else if (arg_is(2u, "trim")) {
@@ -213,8 +214,7 @@ static void execute(void)
         reply_status(RR2_Ctrl_SetHoldExternal(arg_is(1u, "ext")));
     }
     else if (arg_is(0u, "mux")) {
-        reply_status(RR2_Ctrl_SetAnalogMux((uint8_t)arg_i(1u, 1),
-                                           (uint8_t)arg_i(2u, 1)));
+        reply_status(RR2_Ctrl_SetAnalogMux((uint8_t)arg_i(1u, 1)));
     }
     else if (arg_is(0u, "preset")) {
         if (arg_is(1u, "csi")) {

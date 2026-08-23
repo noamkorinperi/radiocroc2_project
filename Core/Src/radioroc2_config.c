@@ -4,11 +4,11 @@
  * @brief   RADIOROC2 - high-level Slow Control configuration sequences.
  *
  * Brings the ASIC into a reproducible baseline for charge/energy readout
- * via the analog multiplexers (OUT_AMUXHG / OUT_AMUXLG), matching the
+ * via the OUT_AMUXLG analog multiplexer output, matching the
  * datasheet "Example 1: default configuration":
  *      - all analog blocks powered / enabled
  *      - shapers + peak detectors on
- *      - analog-mux buffers on (so the ADC on PA4/PA5 sees a signal)
+ *      - LG analog-mux buffer on (so the ADC on PA5 sees a signal)
  *      - acquisition trigger = global Low-threshold Time Trigger (selTrig=0100)
  *
  * The ASIC already powers up at these defaults (Table 4), but writing them
@@ -84,8 +84,8 @@ RR2_Status RR2_ConfigCommon(void)
     /* selTrig=0100 (global T1), hysteresis on, delay cell on */
     if ((st = RR2_Write(RR2_ADDR_COMMON, RR2_COM_SUB_HYST_TRIG, RR2_COM_HYST_TRIG_DEFAULT)) != RR2_OK) return st;
 
-    /* ---- Address 66: outing ---- power the analog-mux buffers.
-       Without this the ADC on PA4/PA5 reads nothing meaningful.       */
+    /* ---- Address 66: outing ---- power the LG analog-mux buffer.
+       Without this the ADC on PA5 reads nothing meaningful.           */
     if ((st = RR2_Write(RR2_ADDR_OUTING, RR2_OUT_SUB_POWER, RR2_OUT_POWER_DEFAULT)) != RR2_OK) return st;
 
     /* ---- Address 67: event validation gating ---- */
