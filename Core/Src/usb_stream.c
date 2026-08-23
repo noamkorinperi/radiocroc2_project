@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    usb_stream.c
- * @brief   Event streaming to the host over USB CDC.
+ * @brief   Event streaming to the host over USART3 -> the ST-Link VCP.
  * @note    See usb_stream.h for the frame layout.
  *
  * Stack note: the F722 project links with a 1 KB main stack, so this
@@ -188,7 +188,7 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     const uint8_t  count = evt->count;
 
     if (tx_format == USBSTREAM_FMT_TEXT) {
-        /* E,seq,ms,tempmC,first,count,hg,lg,hg,lg,...  */
+        /* E,seq,ms,tempmC,first,count,lg,lg,...  */
         if (!text_push("E,"))                    { frames_dropped++; return 0u; }
         if (!text_push_i32((int32_t)evt->seq))   { frames_dropped++; return 0u; }
         if (!text_push(","))                     { frames_dropped++; return 0u; }
@@ -203,8 +203,6 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
         for (uint8_t i = 0u; i < count; ++i) {
             const uint8_t ch = (uint8_t)(first + i);
             if (!text_push(","))                          { frames_dropped++; return 0u; }
-            if (!text_push_i32((int32_t)evt->hg[ch]))     { frames_dropped++; return 0u; }
-            if (!text_push(","))                          { frames_dropped++; return 0u; }
             if (!text_push_i32((int32_t)evt->lg[ch]))     { frames_dropped++; return 0u; }
         }
         if (!text_push("\r\n")) { frames_dropped++; return 0u; }
@@ -212,7 +210,7 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     }
 
     /* ---- Binary ---- */
-    const uint16_t payload_len = (uint16_t)(14u + (4u * (uint32_t)count));
+    const uint16_t payload_len = (uint16_t)(14u + (2u * (uint32_t)count));
     const uint32_t need        = 2u + 1u + 2u + payload_len + 2u;
 
     if (ring_free() < need) {
@@ -226,9 +224,6 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     put_u32_crc((uint32_t)temp_milli_c);
     put_crc(first);
     put_crc(count);
-    for (uint8_t i = 0u; i < count; ++i) {
-        put_u16_crc(evt->hg[(uint8_t)(first + i)]);
-    }
     for (uint8_t i = 0u; i < count; ++i) {
         put_u16_crc(evt->lg[(uint8_t)(first + i)]);
     }

@@ -131,20 +131,38 @@ static void ed_indac(uint8_t c, uint32_t v, uint32_t unused)
     sh.ch[c][RR2_CH_SUB_INDAC] = (uint8_t)v;
 }
 
+/* RR2_KEEP in either half means "read that field back out of the
+   shadow", which is what lets a caller set one gain path without
+   touching the other. Resolved per channel, so it stays correct under
+   RR2_CH_ALL even if the channels have drifted apart.                */
 static void ed_gain(uint8_t c, uint32_t lg, uint32_t hg)
 {
+    const uint8_t cur = sh.ch[c][RR2_CH_SUB_GAIN];
+
+    if (lg == RR2_KEEP) lg = RR2_GET(RR2_LGGAIN, cur);
+    if (hg == RR2_KEEP) hg = RR2_GET(RR2_HGGAIN, cur);
+
     sh.ch[c][RR2_CH_SUB_GAIN] = RR2_NIBBLES((uint8_t)lg, (uint8_t)hg);
 }
 
 static void ed_tau(uint8_t c, uint32_t lg, uint32_t hg)
 {
     /* Datasheet naming quirk: bits [7:4] are tauLG, [3:0] are tauHG. */
+    const uint8_t cur = sh.ch[c][RR2_CH_SUB_TAU];
+
+    if (lg == RR2_KEEP) lg = RR2_GET(RR2_TAULG, cur);
+    if (hg == RR2_KEEP) hg = RR2_GET(RR2_TAUHG, cur);
+
     sh.ch[c][RR2_CH_SUB_TAU] = RR2_NIBBLES((uint8_t)lg, (uint8_t)hg);
 }
 
 static void ed_slow(uint8_t c, uint32_t lg, uint32_t hg)
 {
     uint8_t b = sh.ch[c][RR2_CH_SUB_EN2];
+
+    if (lg == RR2_KEEP) lg = (uint32_t)((b >> RR2_SLOWSHAPINGLG_Pos) & 1u);
+    if (hg == RR2_KEEP) hg = (uint32_t)((b >> RR2_SLOWSHAPINGHG_Pos) & 1u);
+
     b &= (uint8_t)~((1u << RR2_SLOWSHAPINGLG_Pos) | (1u << RR2_SLOWSHAPINGHG_Pos));
     if (lg) b |= (uint8_t)(1u << RR2_SLOWSHAPINGLG_Pos);
     if (hg) b |= (uint8_t)(1u << RR2_SLOWSHAPINGHG_Pos);
@@ -220,13 +238,15 @@ RR2_Status RR2_Ctrl_SetInDac(uint8_t ch, uint8_t value)
 
 RR2_Status RR2_Ctrl_SetChargeGain(uint8_t ch, uint8_t lg, uint8_t hg)
 {
-    if ((lg > 15u) || (hg > 15u)) return RR2_ERR_DATA;
+    if (((lg > 15u) && (lg != RR2_KEEP)) ||
+        ((hg > 15u) && (hg != RR2_KEEP))) return RR2_ERR_DATA;
     return for_each_channel(ch, RR2_CH_SUB_GAIN, ed_gain, lg, hg);
 }
 
 RR2_Status RR2_Ctrl_SetShapingTime(uint8_t ch, uint8_t tau_lg, uint8_t tau_hg)
 {
-    if ((tau_lg > 15u) || (tau_hg > 15u)) return RR2_ERR_DATA;
+    if (((tau_lg > 15u) && (tau_lg != RR2_KEEP)) ||
+        ((tau_hg > 15u) && (tau_hg != RR2_KEEP))) return RR2_ERR_DATA;
     return for_each_channel(ch, RR2_CH_SUB_TAU, ed_tau, tau_lg, tau_hg);
 }
 
@@ -322,16 +342,19 @@ RR2_Status RR2_Ctrl_SetHoldExternal(uint8_t external)
     return RR2_Write(RR2_ADDR_COMMON, RR2_COM_SUB_HYST_TRIG, sh.com_hyst_trig);
 }
 
-RR2_Status RR2_Ctrl_SetAnalogMux(uint8_t enable_hg, uint8_t enable_lg)
+RR2_Status RR2_Ctrl_SetAnalogMux(uint8_t enable)
 {
     uint8_t b = sh.out_power;
 
+    /* HG is cleared unconditionally: OUT_AMUXHG is not connected to an
+       ADC, so powering its buffer only burns current into a dead pad. */
     b &= (uint8_t)~((1u << RR2_EN_AMUXHG_Pos) | (1u << RR2_EN_AMUXLG_Pos));
-    if (enable_hg) b |= (uint8_t)(1u << RR2_EN_AMUXHG_Pos);
-    if (enable_lg) b |= (uint8_t)(1u << RR2_EN_AMUXLG_Pos);
 
-    /* The shared buffer supply must stay on if either mux is used. */
-    if (enable_hg || enable_lg) b |= (uint8_t)(1u << RR2_ON_ABUFFER_Pos);
+    if (enable) {
+        b |= (uint8_t)(1u << RR2_EN_AMUXLG_Pos);
+        /* The buffer supply the mux output shares. */
+        b |= (uint8_t)(1u << RR2_ON_ABUFFER_Pos);
+    }
 
     sh.out_power = b;
     return RR2_Write(RR2_ADDR_OUTING, RR2_OUT_SUB_POWER, sh.out_power);
@@ -360,6 +383,6 @@ RR2_Status RR2_Ctrl_PresetCsI(void)
     st = RR2_Ctrl_SetHoldDelay(255u, 15u);
     if (st != RR2_OK) return st;
 
-    /* Make sure the ADC can actually see the peak detectors. */
-    return RR2_Ctrl_SetAnalogMux(1u, 1u);
+    /* Make sure the ADC can actually see the LG peak detectors. */
+    return RR2_Ctrl_SetAnalogMux(1u);
 }

@@ -12,7 +12,6 @@
 /* ------------------------------------------------------------------ */
 /* Module state                                                        */
 /* ------------------------------------------------------------------ */
-static ADC_HandleTypeDef *rr2_adc_hg = NULL;   /* OUT_AMUXHG -> PA4 */
 static ADC_HandleTypeDef *rr2_adc_lg = NULL;   /* OUT_AMUXLG -> PA5 */
 static uint32_t rr2_seq = 0u;
 
@@ -116,35 +115,20 @@ void RR2_DAQ_WaitHold(void)
 /* ------------------------------------------------------------------ */
 /* Analog sampling                                                     */
 /* ------------------------------------------------------------------ */
-RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg)
+RR2_Status RR2_DAQ_SampleLG(uint16_t *lg)
 {
-    if ((hg == NULL) || (lg == NULL))               return RR2_ERR_DATA;
-    if ((rr2_adc_hg == NULL) || (rr2_adc_lg == NULL)) return RR2_ERR_ADC;
+    if (lg == NULL)          return RR2_ERR_DATA;
+    if (rr2_adc_lg == NULL)  return RR2_ERR_ADC;
 
-    /* ADC1 and ADC2 are independent peripherals, so starting both back
-       to back lets the two gains convert in parallel: one conversion
-       time for both samples instead of two.                          */
-    if (HAL_ADC_Start(rr2_adc_hg) != HAL_OK) return RR2_ERR_ADC;
-    if (HAL_ADC_Start(rr2_adc_lg) != HAL_OK) {
-        HAL_ADC_Stop(rr2_adc_hg);
-        return RR2_ERR_ADC;
-    }
+    if (HAL_ADC_Start(rr2_adc_lg) != HAL_OK) return RR2_ERR_ADC;
 
-    if (HAL_ADC_PollForConversion(rr2_adc_hg, RR2_ADC_TIMEOUT_MS) != HAL_OK) {
-        HAL_ADC_Stop(rr2_adc_hg);
-        HAL_ADC_Stop(rr2_adc_lg);
-        return RR2_ERR_ADC;
-    }
     if (HAL_ADC_PollForConversion(rr2_adc_lg, RR2_ADC_TIMEOUT_MS) != HAL_OK) {
-        HAL_ADC_Stop(rr2_adc_hg);
         HAL_ADC_Stop(rr2_adc_lg);
         return RR2_ERR_ADC;
     }
 
-    *hg = (uint16_t)HAL_ADC_GetValue(rr2_adc_hg);
     *lg = (uint16_t)HAL_ADC_GetValue(rr2_adc_lg);
 
-    HAL_ADC_Stop(rr2_adc_hg);
     HAL_ADC_Stop(rr2_adc_lg);
     return RR2_OK;
 }
@@ -152,9 +136,8 @@ RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg)
 /* ------------------------------------------------------------------ */
 /* Public entry points                                                 */
 /* ------------------------------------------------------------------ */
-void RR2_DAQ_Init(ADC_HandleTypeDef *adc_hg, ADC_HandleTypeDef *adc_lg)
+void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg)
 {
-    rr2_adc_hg = adc_hg;
     rr2_adc_lg = adc_lg;
     rr2_seq    = 0u;
     RR2_DWT_Enable();
@@ -191,7 +174,7 @@ RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count)
         RR2_DAQ_ClockOnce();                                  /* select ch */
         RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_MUX_SETTLE_NS)); /* let it settle */
 
-        RR2_Status st = RR2_DAQ_SampleBothGains(&evt->hg[ch], &evt->lg[ch]);
+        RR2_Status st = RR2_DAQ_SampleLG(&evt->lg[ch]);
         if (st != RR2_OK) {
             RR2_DAQ_EndOfReadout();   /* always re-arm the ASIC */
             return st;

@@ -23,8 +23,10 @@ Event payload:
     8   4   temperature, milli-Celsius (signed)
     12  1   first channel
     13  1   channel count
-    14  2*count  high-gain codes
-    ..  2*count  low-gain codes
+    14  2*count  OUT_AMUXLG codes, one per channel
+
+Only OUT_AMUXLG is wired to an ADC on the board, so an event carries one
+code per channel, not one per gain path.
 
 The command interface shares this one UART and its replies are plain
 text with no framing, so they show up as gaps between frames. Decoder
@@ -91,11 +93,11 @@ def describe_ports():
 FRAME_EVENT = 1
 FRAME_STATUS = 2
 
-# Longest payload the firmware can emit: a 64-channel event is 20 header
-# bytes plus 4 per channel. Status frames are 35. plen is a uint16, so a
+# Longest payload the firmware can emit: a 64-channel event is 14 header
+# bytes plus 2 per channel. Status frames are 27. plen is a uint16, so a
 # false sync can claim up to 65535 - bounding it here is what stops the
 # parser stalling on two bytes of data that happened to read A5 5A.
-MAX_PAYLOAD = 20 + 4 * 64          # 276
+MAX_PAYLOAD = 14 + 2 * 64          # 142
 
 # Cap on the recovered-text buffer. A link that is pure noise must not be
 # able to grow it without bound.
@@ -229,10 +231,7 @@ class Decoder:
     def _parse(ftype: int, p: bytes):
         if ftype == FRAME_EVENT:
             seq, ts, temp, first, count = struct.unpack_from("<IIiBB", p, 0)
-            off = 14
-            hg = list(struct.unpack_from(f"<{count}H", p, off))
-            off += 2 * count
-            lg = list(struct.unpack_from(f"<{count}H", p, off))
+            lg = list(struct.unpack_from(f"<{count}H", p, 14))
             return {
                 "type": "event",
                 "seq": seq,
@@ -240,7 +239,6 @@ class Decoder:
                 "temp_c": temp / 1000.0,
                 "first_ch": first,
                 "count": count,
-                "hg": hg,
                 "lg": lg,
             }
 
@@ -307,19 +305,18 @@ def main():
     if args.csv:
         csv_fh = open(args.csv, "w", newline="")
         writer = csv.writer(csv_fh)
-        writer.writerow(["seq", "t_ms", "temp_c", "ch", "hg", "lg"])
+        writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg"])
 
     def handle(frame):
         if frame["type"] == "event":
-            peak = max(frame["hg"]) if frame["hg"] else 0
+            peak = max(frame["lg"]) if frame["lg"] else 0
             print(f"EVT seq={frame['seq']:<6} t={frame['t_ms']/1000:8.3f}s "
                   f"T={frame['temp_c']:6.2f}C ch={frame['first_ch']}+{frame['count']} "
-                  f"maxHG={peak}")
+                  f"maxLG={peak}")
             if writer:
                 for i in range(frame["count"]):
                     writer.writerow([frame["seq"], frame["t_ms"], frame["temp_c"],
-                                     frame["first_ch"] + i,
-                                     frame["hg"][i], frame["lg"][i]])
+                                     frame["first_ch"] + i, frame["lg"][i]])
         elif frame["type"] == "status":
             print(f"STA up={frame['uptime_ms']/1000:.1f}s trig={frame['triggers']} "
                   f"ok={frame['events_ok']} bad={frame['events_bad']} "

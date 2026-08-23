@@ -71,7 +71,7 @@ volatile uint8_t  g_rr2_sc_error = 0;
 volatile RR2_Status g_rr2_cfg_status = RR2_OK;
 volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
 
-/* Most recent digitised event (~260 bytes, lives in .bss).         */
+/* Most recent digitised event (~136 bytes, lives in .bss).         */
 RR2_Event g_rr2_event;
 volatile RR2_Status g_rr2_read_status = RR2_OK;
 volatile uint32_t   g_rr2_events_ok   = 0;
@@ -192,7 +192,9 @@ int main(void)
     RR2_StartClocks();                    /* CLK_SM_I2C = 2 MHz           */
     RR2_HW_ReleaseResets();               /* de-assert active-low resets  */
     RR2_Init(&hi2c1);                     /* bind the Slow Control driver */
-    RR2_DAQ_Init(&hadc1, &hadc2);         /* bind ADCs, enable DWT timer  */
+    /* Only OUT_AMUXLG is instrumented, on PA5 / ADC2_IN5. ADC1 (PA4) is
+       still brought up by CubeMX above, but nothing reads it. */
+    RR2_DAQ_Init(&hadc2);                 /* bind the ADC, enable DWT     */
     g_rr2_timing_ok = RR2_DAQ_IsTimingOk();
 
     /* Temperature sensor lives on its own bus, independent of the ASIC. */
@@ -342,7 +344,7 @@ void SystemClock_Config(void)
 /**
  * @brief Start the clock the ASIC's I2C slave core needs.
  *
- * CLK_SM_I2C (PA8 / TIM1_CH1) MUST run at exactly 20x the SCL
+ * CLK_SM_I2C (PE9 / TIM1_CH1) MUST run at exactly 20x the SCL
  * frequency: 100 kHz SCL -> 2 MHz here.
  *
  * CK_READ is deliberately NOT started here. It is burst generated in

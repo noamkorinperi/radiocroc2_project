@@ -1,15 +1,16 @@
 /**
  ******************************************************************************
  * @file    usb_stream.h
- * @brief   Event streaming to the host over USB CDC (virtual COM port).
+ * @brief   Event streaming to the host over USART3 -> the ST-Link VCP.
  *
  * Two output formats share one transmit path:
  *
  *   BINARY (default) - framed, compact, CRC protected. A full 64-channel
- *                      event is 277 bytes, so 1 kHz of events is about
- *                      277 kB/s, comfortable for USB Full Speed.
+ *                      event is 149 bytes, and 921600 baud 8N1 carries
+ *                      about 92 kB/s, so the link sustains roughly 610
+ *                      full events per second before frames drop.
  *   TEXT             - human readable CSV, for bring-up only. The same
- *                      event is roughly 1.3 kB, so it only keeps up at
+ *                      event is roughly 0.4 kB, so it only keeps up at
  *                      low rates. Handy with any serial terminal.
  *
  * Binary frame layout (little endian):
@@ -27,11 +28,13 @@
  *   8   4   temperature, milli-Celsius (signed)
  *   12  1   first channel
  *   13  1   channel count
- *   14  2*count  high-gain ADC codes
- *   ..  2*count  low-gain ADC codes
+ *   14  2*count  OUT_AMUXLG ADC codes, one per channel
  *
- * Transmission is buffered. CDC_Transmit_FS refuses a new transfer while
- * one is in flight, so frames are queued in a ring and pumped out by
+ * One code per channel, not two: the board digitises only OUT_AMUXLG.
+ * See radioroc2_daq.h.
+ *
+ * Transmission is buffered. The UART DMA carries one contiguous span at
+ * a time, so frames are queued in a ring and pumped out by
  * USBStream_Task(). If the host stops reading the ring fills, and new
  * frames are DROPPED rather than blocking the DAQ - the drop counter
  * makes that visible instead of silently stretching dead time.
@@ -43,7 +46,7 @@
 #include "radioroc2_daq.h"
 #include <stdint.h>
 
-/* Ring size. 8 KB holds roughly 30 full events of burst. */
+/* Ring size. 8 KB holds roughly 55 full events of burst. */
 #ifndef USBSTREAM_RING_SIZE
 #define USBSTREAM_RING_SIZE     8192u
 #endif

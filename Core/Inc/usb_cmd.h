@@ -1,17 +1,17 @@
 /**
  ******************************************************************************
  * @file    usb_cmd.h
- * @brief   Line-based command interface over USB CDC.
+ * @brief   Line-based command interface over the host link.
  *
  * Configuration traffic is tiny and interactive, so it is plain text:
  * type commands in any serial terminal, or script them from Python.
  * Only the event stream is binary.
  *
  * THREADING
- * CDC_Receive_FS runs in USB interrupt context, where blocking I2C is
- * not allowed. USBCmd_Feed() therefore only copies bytes into a ring
- * (ISR safe), and USBCmd_Task() does the parsing and the ASIC writes
- * from the main loop.
+ * HAL_UART_RxCpltCallback() runs in USART3 interrupt context, where
+ * blocking I2C is not allowed. USBCmd_Feed() therefore only copies
+ * bytes into a ring (ISR safe), and USBCmd_Task() does the parsing and
+ * the ASIC writes from the main loop.
  *
  * COMMAND SET
  *   help                       list commands
@@ -19,9 +19,9 @@
  *   fmt bin|txt                event stream format
  *
  *   ch <n|all> indac <0-255>           SiPM overvoltage trim
- *   ch <n|all> gain <lg 0-15> <hg 0-15>   charge preamp gains
- *   ch <n|all> tau  <lg 0-15> <hg 0-15>   shaper peaking time index
- *   ch <n|all> slow <lg 0|1> <hg 0|1>     120 ns shaping steps
+ *   ch <n|all> gain <lg 0-15> [hg]     charge preamp gains
+ *   ch <n|all> tau  <lg 0-15> [hg]     shaper peaking time index
+ *   ch <n|all> slow <lg 0|1> [hg]      120 ns shaping steps
  *   ch <n|all> patgain <0-63>          time preamp gain
  *   ch <n|all> trim <t1 0-63> <t2 0-63>   per-channel threshold trim
  *   ch <n|all> on|off                  enable / disable the channel
@@ -32,7 +32,7 @@
  *   delay <0-255> <slope 0-15>         peak-detector hold delay
  *   trig <0-15>                        selTrig[3:0]
  *   hold int|ext                       hold source
- *   mux <hg 0|1> <lg 0|1>              analog mux buffer power
+ *   mux <0|1>                          LG analog mux buffer power
  *
  *   preset csi                         starting point for CsI(Tl)
  *   defaults                           reload datasheet defaults
@@ -45,6 +45,13 @@
  *                                      scan + repeated write/read/verify,
  *                                      reported as i2ctest.* key=value
  *                                      lines. See rr2_i2ctest.h.
+ *
+ * ONE GAIN IS READ OUT
+ * The ADC only sees OUT_AMUXLG, so it is the lg half of gain / tau /
+ * slow that shapes the spectrum. The hg half is OPTIONAL: leave the
+ * argument off and the HG chain keeps exactly what it already had.
+ * It stays settable from here because it feeds the charge trigger, but
+ * nothing digitises it and the GUI no longer offers it.
  ******************************************************************************
  */
 #ifndef USB_CMD_H
@@ -63,7 +70,7 @@
 /** Clear the receive ring and line buffer. */
 void USBCmd_Init(void);
 
-/** Push received bytes. ISR safe - call from CDC_Receive_FS. */
+/** Push received bytes. ISR safe - call from HAL_UART_RxCpltCallback. */
 void USBCmd_Feed(const uint8_t *data, uint32_t len);
 
 /** Parse and execute complete lines. Call from the main loop. */
