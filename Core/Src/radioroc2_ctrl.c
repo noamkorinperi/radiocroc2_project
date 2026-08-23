@@ -266,17 +266,6 @@ RR2_Status RR2_Ctrl_SetChargeInjection(uint8_t ch, uint8_t enable, uint8_t use_c
     return for_each_channel(ch, RR2_CH_SUB_EN2, ed_ctest, enable, use_ctest);
 }
 
-RR2_Status RR2_Ctrl_ApplyChannelMask(uint64_t mask)
-{
-    for (uint8_t c = 0u; c < RR2_NUM_CHANNELS; ++c) {
-        const uint8_t on = ((mask >> c) & 1u) ? 1u : 0u;
-
-        RR2_Status st = RR2_Ctrl_SetChannelEnabled(c, on);
-        if (st != RR2_OK) return st;
-    }
-    return RR2_OK;
-}
-
 /* ------------------------------------------------------------------ */
 /* Global setters                                                      */
 /* ------------------------------------------------------------------ */

@@ -16,10 +16,6 @@ static ADC_HandleTypeDef *rr2_adc_hg = NULL;   /* OUT_AMUXHG -> PA4 */
 static ADC_HandleTypeDef *rr2_adc_lg = NULL;   /* OUT_AMUXLG -> PA5 */
 static uint32_t rr2_seq = 0u;
 
-/* Which channels to digitise. All of them until told otherwise, so the
-   default behaviour matches a full 64-channel sweep. */
-static uint64_t rr2_mask = RR2_MASK_ALL;
-
 /* Per-conversion timeout. One conversion at 144+15 cycles / 27 MHz is
    about 5.9 us, so 2 ms is a very generous ceiling.                   */
 #define RR2_ADC_TIMEOUT_MS   2u
@@ -120,21 +116,6 @@ void RR2_DAQ_WaitHold(void)
 /* ------------------------------------------------------------------ */
 /* Analog sampling                                                     */
 /* ------------------------------------------------------------------ */
-
-/**
- * @brief Disable both converters after a failed conversion.
- *
- * Only ever called on the error path. A conversion that timed out has
- * left the peripheral somewhere the state machine does not describe, so
- * the next sample is better off re-enabling from scratch and paying the
- * stabilisation wait once than inheriting it.
- */
-static void RR2_ADC_StopBoth(void)
-{
-    (void)HAL_ADC_Stop(rr2_adc_hg);
-    (void)HAL_ADC_Stop(rr2_adc_lg);
-}
-
 RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg)
 {
     if ((hg == NULL) || (lg == NULL))               return RR2_ERR_DATA;
@@ -142,38 +123,29 @@ RR2_Status RR2_DAQ_SampleBothGains(uint16_t *hg, uint16_t *lg)
 
     /* ADC1 and ADC2 are independent peripherals, so starting both back
        to back lets the two gains convert in parallel: one conversion
-       time for both samples instead of two.
-
-       Neither is stopped on the way out. HAL_ADC_Start only pays the
-       Tstab wait when it finds ADON clear, so leaving the converters
-       enabled turns every later call into a bare SWSTART. That wait is
-       not the 3 us the constant suggests: the HAL spins 648 times on a
-       volatile counter, which is six instructions an iteration, so it
-       costs about 25 us in reality - per converter, per channel, next
-       to a conversion that takes 5.8 us. Stopping between channels was
-       spending nine tenths of the readout waiting for an ADC that had
-       never gone anywhere.
-
-       The converters idle between conversions, so the only cost of
-       leaving them on is their bias current. */
+       time for both samples instead of two.                          */
     if (HAL_ADC_Start(rr2_adc_hg) != HAL_OK) return RR2_ERR_ADC;
     if (HAL_ADC_Start(rr2_adc_lg) != HAL_OK) {
-        RR2_ADC_StopBoth();
+        HAL_ADC_Stop(rr2_adc_hg);
         return RR2_ERR_ADC;
     }
 
     if (HAL_ADC_PollForConversion(rr2_adc_hg, RR2_ADC_TIMEOUT_MS) != HAL_OK) {
-        RR2_ADC_StopBoth();
+        HAL_ADC_Stop(rr2_adc_hg);
+        HAL_ADC_Stop(rr2_adc_lg);
         return RR2_ERR_ADC;
     }
     if (HAL_ADC_PollForConversion(rr2_adc_lg, RR2_ADC_TIMEOUT_MS) != HAL_OK) {
-        RR2_ADC_StopBoth();
+        HAL_ADC_Stop(rr2_adc_hg);
+        HAL_ADC_Stop(rr2_adc_lg);
         return RR2_ERR_ADC;
     }
 
     *hg = (uint16_t)HAL_ADC_GetValue(rr2_adc_hg);
     *lg = (uint16_t)HAL_ADC_GetValue(rr2_adc_lg);
 
+    HAL_ADC_Stop(rr2_adc_hg);
+    HAL_ADC_Stop(rr2_adc_lg);
     return RR2_OK;
 }
 
@@ -192,76 +164,32 @@ void RR2_DAQ_Init(ADC_HandleTypeDef *adc_hg, ADC_HandleTypeDef *adc_lg)
     HAL_GPIO_WritePin(RSTN_READ_GPIO_Port, RSTN_READ_Pin, GPIO_PIN_SET);
 }
 
-/* ------------------------------------------------------------------ */
-/* Channel selection                                                   */
-/* ------------------------------------------------------------------ */
-void RR2_DAQ_SetChannelMask(uint64_t mask)
-{
-    rr2_mask = mask;
-}
-
-uint64_t RR2_DAQ_GetChannelMask(void)
-{
-    return rr2_mask;
-}
-
-uint8_t RR2_DAQ_GetChannelCount(void)
-{
-    return (uint8_t)__builtin_popcountll(rr2_mask);
-}
-
-RR2_Status RR2_DAQ_SelectChannels(const uint8_t *list, uint8_t n)
-{
-    uint64_t m = RR2_MASK_NONE;
-
-    if ((list == NULL) && (n > 0u)) return RR2_ERR_DATA;
-
-    /* Built into a temporary first, so a bad entry anywhere in the list
-       leaves the live mask alone rather than half-applied. */
-    for (uint8_t i = 0u; i < n; ++i) {
-        if (list[i] >= RR2_NUM_CHANNELS) return RR2_ERR_DATA;
-        m |= RR2_MASK_CH(list[i]);
-    }
-
-    rr2_mask = m;
-    return RR2_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* Readout                                                             */
-/* ------------------------------------------------------------------ */
-RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt)
+RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count)
 {
     if (evt == NULL) return RR2_ERR_DATA;
-
-    const uint64_t mask = rr2_mask;
-
-    evt->mask = mask;
-    evt->seq  = ++rr2_seq;
-
-    if (mask == RR2_MASK_NONE) {
-        /* Nothing selected. Still re-arm the ASIC, otherwise the peak
-           detectors stay frozen and no further trigger ever arrives. */
-        RR2_DAQ_EndOfReadout();
-        return RR2_OK;
+    if ((first_ch >= RR2_NUM_CHANNELS) ||
+        ((uint16_t)first_ch + count > RR2_NUM_CHANNELS)) {
+        return RR2_ERR_DATA;
     }
 
-    /* Highest selected channel - there is no reason to keep clocking
-       past it once its conversion is in. */
-    const uint8_t last = (uint8_t)(63 - __builtin_clzll(mask));
+    evt->first_ch = first_ch;
+    evt->count    = count;
+    evt->seq      = ++rr2_seq;
 
     RR2_DAQ_ResetReadPointer();
 
-    for (uint8_t ch = 0u; ch <= last; ++ch) {
-        /* Every channel costs one clock edge; the read register has no
-           way to skip. What we avoid for unselected channels is the
-           settling wait and the two ADC conversions, which is where
-           essentially all of the time goes. */
+    /* Fast-forward: advance past the channels we do not digitise.
+       No settling wait is needed because nothing is sampled here.     */
+    for (uint8_t i = 0u; i < first_ch; ++i) {
         RR2_DAQ_ClockOnce();
+    }
 
-        if ((mask & RR2_MASK_CH(ch)) == 0u) continue;
+    /* Digitise the requested window. */
+    for (uint8_t i = 0u; i < count; ++i) {
+        const uint8_t ch = (uint8_t)(first_ch + i);
 
-        RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_MUX_SETTLE_NS));
+        RR2_DAQ_ClockOnce();                                  /* select ch */
+        RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_MUX_SETTLE_NS)); /* let it settle */
 
         RR2_Status st = RR2_DAQ_SampleBothGains(&evt->hg[ch], &evt->lg[ch]);
         if (st != RR2_OK) {
@@ -272,4 +200,9 @@ RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt)
 
     RR2_DAQ_EndOfReadout();
     return RR2_OK;
+}
+
+RR2_Status RR2_DAQ_ReadEvent(RR2_Event *evt)
+{
+    return RR2_DAQ_ReadWindow(evt, 0u, RR2_NUM_CHANNELS);
 }

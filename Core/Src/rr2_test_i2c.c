@@ -26,10 +26,9 @@
 /* ------------------------------------------------------------------ */
 /* Controls                                                            */
 /* ------------------------------------------------------------------ */
-volatile uint8_t  g_test_i2c_mode       = 0u;
-volatile uint8_t  g_test_i2c_pattern    = RR2_TEST_I2C_SINGLE;
-volatile uint16_t g_test_i2c_gap_ms     = 1u;
-volatile uint8_t  g_test_i2c_scan_apply = 0u;
+volatile uint8_t  g_test_i2c_mode    = 0u;
+volatile uint8_t  g_test_i2c_pattern = RR2_TEST_I2C_SINGLE;
+volatile uint16_t g_test_i2c_gap_ms  = 1u;
 
 /* ------------------------------------------------------------------ */
 /* Measurements                                                        */
@@ -40,11 +39,6 @@ volatile uint32_t g_test_i2c_frame_us  = 0u;
 volatile uint32_t g_test_i2c_ratio_x10 = 0u;
 volatile uint32_t g_test_i2c_ok        = 0u;
 volatile uint32_t g_test_i2c_fail      = 0u;
-
-volatile uint16_t g_test_i2c_scan_map    = 0u;
-volatile uint8_t  g_test_i2c_scan_found  = RR2_CHIP_ID_NONE;
-volatile uint8_t  g_test_i2c_scan_active = 0u;
-volatile uint32_t g_test_i2c_scan_passes = 0u;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -158,48 +152,6 @@ static void pattern_slowctrl(void)
     derive_frequencies(ns0);
 }
 
-/**
- * @brief Sweep all 16 chip ids and report which ones answer.
- *
- * This is the pattern to run when the board's CHIP_ID strapping is
- * unknown. On the scope you will see 32 short probe frames march up
- * through the address space; the one (or ones) that ACK stand out
- * because SDA is pulled low on the 9th clock instead of floating high.
- *
- * Slower than the other patterns - a sweep costs up to 32 timeouts
- * when nothing is connected - so it deliberately runs one sweep per
- * pass with the usual gap after it.
- */
-static void pattern_scan(void)
-{
-    uint16_t map = 0u;
-
-    const uint8_t found = RR2_ScanChipId(&map);
-
-    g_test_i2c_scan_map   = map;
-    g_test_i2c_scan_found = found;
-
-    if (found == RR2_CHIP_ID_NONE) {
-        g_test_i2c_fail++;
-        g_test_i2c_status = (uint8_t)HAL_ERROR;
-    } else {
-        g_test_i2c_ok++;
-        g_test_i2c_status = (uint8_t)HAL_OK;
-
-        /* Opt-in: retarget the driver so the other patterns, and the
-           DAQ afterwards, talk to the chip that actually answered. */
-        if (g_test_i2c_scan_apply) {
-            RR2_SetChipId(found);
-        }
-    }
-
-    g_test_i2c_scan_active = RR2_GetChipId();
-    g_test_i2c_scan_passes++;
-
-    /* A sweep says nothing about bus timing, so leave the frequency
-       figures from whatever pattern measured them last. */
-}
-
 /* ------------------------------------------------------------------ */
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
@@ -209,7 +161,7 @@ void RR2_TestI2C_Task(void)
 
     /* The ASIC's I2C slave core is clocked by CLK_SM_I2C. Without it the
        chip cannot answer, and the whole test would report a dead bus for
-       the wrong reason. Make sure PA8 is running before touching SCL. */
+       the wrong reason. Make sure PE9 is running before touching SCL. */
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
     g_test_i2c_ok   = 0u;
@@ -217,10 +169,6 @@ void RR2_TestI2C_Task(void)
 
     while (g_test_i2c_mode) {
         switch (g_test_i2c_pattern) {
-        case RR2_TEST_I2C_SCAN:
-            pattern_scan();
-            break;
-
         case RR2_TEST_I2C_SLOWCTRL:
             pattern_slowctrl();
             break;

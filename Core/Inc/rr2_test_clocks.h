@@ -1,7 +1,7 @@
 /**
  ******************************************************************************
  * @file    rr2_test_clocks.h
- * @brief   Scope test 1 of 2 - CLK_SM_I2C (PA8) and CK_READ (PA1) timing.
+ * @brief   Scope test 1 of 2 - CLK_SM_I2C (PE9) and CK_READ (PA1) timing.
  *
  * WHAT THIS TEST ANSWERS
  * The readout clock is bit-banged in software (radioroc2_daq.c), so the
@@ -13,7 +13,7 @@
  * back through the debugger as a cross-check.
  *
  * PROBE SETUP
- *   CH1 -> PA8  (CLK_SM_I2C)  free-running 2.000 MHz, the known-good ref
+ *   CH1 -> PE9  (CLK_SM_I2C)  free-running 2.000 MHz, the known-good ref
  *   CH2 -> PA1  (CK_READ)     the signal under test
  *   Trigger on CH2. In BURST pattern the inter-burst gap gives a stable
  *   trigger point; in SQUARE pattern trigger on either edge.

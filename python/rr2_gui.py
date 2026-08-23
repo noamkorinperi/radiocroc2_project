@@ -195,7 +195,6 @@ class Link:
                     "type": "event", "seq": seq,
                     "t_ms": int((now - t0) * 1000),
                     "temp_c": 24.8 + 0.4 * random.random(),
-                    "mask": 1, "channels": [0],
                     "first_ch": 0, "count": 1,
                     "hg": [hg], "lg": [lg],
                 })
@@ -1072,12 +1071,9 @@ class PageMeasure(Page):
         if frame["type"] != "event" or not self.running:
             return
 
-        # The selection can be sparse, so look the channel up rather
-        # than deriving its position from a first/count pair.
         ch = self.v_ch.get()
-        try:
-            idx = frame["channels"].index(ch)
-        except (KeyError, ValueError):
+        idx = ch - frame["first_ch"]
+        if idx < 0 or idx >= frame["count"]:
             return
 
         hg = frame["hg"][idx]

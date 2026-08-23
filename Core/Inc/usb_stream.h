@@ -25,15 +25,10 @@
  *   0   4   sequence number
  *   4   4   timestamp, ms since boot
  *   8   4   temperature, milli-Celsius (signed)
- *   12  8   channel mask, bit N = channel N present
- *   20  2*n  high-gain ADC codes, ascending channel order
- *   ..  2*n  low-gain ADC codes
- * where n = popcount(mask).
- *
- * The mask travels in every frame rather than being announced once,
- * so a frame is self-describing: losing one frame never desynchronises
- * the ones after it, and the host does not have to track state. With
- * five detectors that is 47 bytes per event instead of 277.
+ *   12  1   first channel
+ *   13  1   channel count
+ *   14  2*count  high-gain ADC codes
+ *   ..  2*count  low-gain ADC codes
  *
  * Transmission is buffered. CDC_Transmit_FS refuses a new transfer while
  * one is in flight, so frames are queued in a ring and pumped out by
@@ -73,7 +68,6 @@ typedef enum {
 
 /** Status snapshot sent alongside the event stream. */
 typedef struct {
-    uint64_t channel_mask;    /* which channels are armed           */
     uint32_t uptime_ms;
     uint32_t trigger_count;
     uint32_t events_ok;

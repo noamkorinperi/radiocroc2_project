@@ -8,7 +8,7 @@
  * (everything just NACKs) and are trivial to tell apart on a scope:
  *
  *   1. Is SCL the frequency we think it is?
- *      The ASIC requires clk_sm_i2c = 20 x SCL. PA8 runs at exactly
+ *      The ASIC requires clk_sm_i2c = 20 x SCL. PE9 runs at exactly
  *      2.000 MHz, so SCL must be 100 kHz. But the CubeMX timing word
  *      0x20404768 gives tSCLH = 4.00 us and tSCLL = 5.83 us, i.e. about
  *      101.7 kHz nominal - a ratio of 19.7, just UNDER the required 20.
@@ -28,10 +28,10 @@
  * PROBE SETUP
  *   CH1 -> PB8  (SCL)
  *   CH2 -> PB9  (SDA)
- *   CH3 -> PA8  (CLK_SM_I2C), if you have a third channel
+ *   CH3 -> PE9  (CLK_SM_I2C), if you have a third channel
  *
  * With CH3 connected you can read the 20:1 ratio directly off the
- * screen: count PA8 edges inside one SCL period. That measurement is
+ * screen: count PE9 edges inside one SCL period. That measurement is
  * the whole point of this test.
  *
  * Trigger on CH2 falling edge (START condition, SDA falling while SCL
@@ -79,23 +79,12 @@
    frame but not the rest.                                             */
 #define RR2_TEST_I2C_SLOWCTRL   2u
 
-/* Sweep all 16 possible CHIP_IDs and report which ones answer. Use this
-   when you do not know how the board straps CHIP_ID<3:0> - there is no
-   register to read it from, because the id IS part of the I2C address,
-   so asking all 16 is the only way to find out.                       */
-#define RR2_TEST_I2C_SCAN       3u
-
 /* ------------------------------------------------------------------ */
 /* Controls - write these from Live Expressions                        */
 /* ------------------------------------------------------------------ */
 extern volatile uint8_t  g_test_i2c_mode;      /* 0 = off, 1 = run     */
 extern volatile uint8_t  g_test_i2c_pattern;   /* RR2_TEST_I2C_*       */
 extern volatile uint16_t g_test_i2c_gap_ms;    /* gap between frames   */
-
-/* SCAN only: set to 1 to have a successful scan point the driver at the
-   id it found, so SINGLE / SLOWCTRL and the DAQ immediately talk to the
-   right chip. Left at 0 the scan only reports. */
-extern volatile uint8_t  g_test_i2c_scan_apply;
 
 /* ------------------------------------------------------------------ */
 /* Measurements - read these from Live Expressions                     */
@@ -106,19 +95,6 @@ extern volatile uint32_t g_test_i2c_frame_us;   /* one transaction     */
 extern volatile uint32_t g_test_i2c_ratio_x10;  /* clk:SCL ratio x10   */
 extern volatile uint32_t g_test_i2c_ok;         /* ACKed               */
 extern volatile uint32_t g_test_i2c_fail;       /* NACKed / timed out  */
-
-/* SCAN results.
- *   g_test_i2c_scan_map    bit N set = chip id N answered. 0 = nothing
- *                          on the bus. More than one bit set means
- *                          either several ASICs, or a foreign device.
- *   g_test_i2c_scan_found  lowest id that answered, 0xFF if none
- *   g_test_i2c_scan_active the id the driver is currently using
- *   g_test_i2c_scan_passes increments once per full sweep
- */
-extern volatile uint16_t g_test_i2c_scan_map;
-extern volatile uint8_t  g_test_i2c_scan_found;
-extern volatile uint8_t  g_test_i2c_scan_active;
-extern volatile uint32_t g_test_i2c_scan_passes;
 
 /**
  * @brief Run the I2C test for as long as g_test_i2c_mode stays non-zero.

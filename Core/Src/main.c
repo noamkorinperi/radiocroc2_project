@@ -44,21 +44,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* ---------------------------------------------------------------
- * Which ASIC inputs actually carry a detector.
- *
- * The sensors are modular rather than soldered, so this is the one
- * place to edit when the arrangement changes - and it can also be
- * changed at runtime without reflashing, with "sel 3 9 20 41 55"
- * over the command link.
- *
- * The list does NOT have to be contiguous. Unselected channels are
- * clocked past without being digitised, and are disabled in the ASIC
- * so they cannot fire the trigger on their own noise.
- *
- * Leave it empty to start with all 64 enabled.
- * ------------------------------------------------------------- */
-static const uint8_t RR2_DETECTOR_CHANNELS[] = { 0, 1, 2, 3, 4 };
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -84,16 +70,6 @@ volatile uint8_t  g_rr2_sc_error = 0;
    debugger: RR2_OK (0) means the ASIC accepted the full config.    */
 volatile RR2_Status g_rr2_cfg_status = RR2_OK;
 volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
-
-/* Result of the boot-time CHIP_ID sweep. Inspect these first when the
-   ASIC looks dead - they separate "wrong address" from "no bus". */
-volatile uint16_t g_rr2_chip_map    = 0;      /* bit N = id N answered */
-volatile uint8_t  g_rr2_chip_found  = RR2_CHIP_ID_NONE;
-volatile uint8_t  g_rr2_chip_active = 0;      /* id actually in use    */
-
-/* Channels carrying a detector. Mirrors the DAQ mask, exposed here so
-   it shows up next to the rest of the state in the debugger. */
-volatile uint64_t g_rr2_channel_mask = 0;
 
 /* Most recent digitised event (~260 bytes, lives in .bss).         */
 RR2_Event g_rr2_event;
@@ -146,34 +122,13 @@ int main(void)
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
 
-  /* Enable the CPU Cache */
-
-  /* Enable I-Cache---------------------------------------------------------*/
-  SCB_EnableICache();
-
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-  /* Flash ART accelerator and prefetch buffer.
-   *
-   * HAL_Init() has already switched both on from PREFETCH_ENABLE and
-   * ART_ACCELERATOR_ENABLE in stm32f7xx_hal_conf.h, so these two lines
-   * normally set bits that are already set. They are here because the
-   * .ioc has no knob for either - CORTEX_M7 tracks CPU_ICache and
-   * nothing else - so the next Generate Code rewrites both defines back
-   * to 0U and the setting would vanish with nothing to show for it.
-   * Same trap as the link baud; see USART3_Init 2. This block survives
-   * regeneration, so the configuration self-heals.
-   *
-   * Safe next to the caches: ART only accelerates instruction fetch
-   * from flash, and every timing constraint in the DAQ is gated by
-   * DWT->CYCCNT, which counts core cycles regardless of fetch speed.
-   * D-cache stays off deliberately - the DMA writes straight to RAM. */
-  __HAL_FLASH_ART_ENABLE();
-  __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -215,45 +170,21 @@ int main(void)
      * answered, otherwise a later 'push' from the host would write
      * zeros everywhere. */
     RR2_Ctrl_ResetShadow();
-
-    /* CHIP_ID<3:0> is strapped on the board and cannot be read from any
-     * register - the id IS part of the I2C address. So ask all 16 and
-     * point the driver at whichever one answers. Without this, a board
-     * strapped to anything other than RR2_CHIP_ID would look completely
-     * dead even though the bus is perfectly healthy.
-     *
-     * g_rr2_chip_map is the full picture, kept for the debugger:
-     *   0      nothing answered - check power, resets and pull-ups
-     *   one bit set   normal
-     *   several bits  more than one ASIC, or a foreign device on the bus
-     */
-    g_rr2_chip_found = RR2_ScanChipId((uint16_t *)&g_rr2_chip_map);
-    if (g_rr2_chip_found != RR2_CHIP_ID_NONE) {
-        RR2_SetChipId(g_rr2_chip_found);
+    /* Scan all 16 possible chip IDs to find which one ACKs. */
+    volatile uint8_t found_id = 0xFF;
+    for (uint8_t id = 0; id < 16; id++) {
+        uint8_t addr = (uint8_t)(((id << 3) | 0) << 1);   /* R0 of that chip id */
+        if (HAL_I2C_IsDeviceReady(&hi2c1, addr, 3, 100) == HAL_OK) {
+            found_id = id;
+            break;
+        }
     }
-    g_rr2_chip_active = RR2_GetChipId();
-
+    /* breakpoint here, read found_id */
     g_rr2_online = RR2_Bringup();
 
-    /* Tell the readout which inputs to digitise. Done before PushAll so
-     * the enable bits it writes already reflect the selection, instead
-     * of enabling all 64 and switching most off again a moment later. */
-    if (sizeof(RR2_DETECTOR_CHANNELS) > 0u) {
-        (void)RR2_DAQ_SelectChannels(RR2_DETECTOR_CHANNELS,
-                                     (uint8_t)sizeof(RR2_DETECTOR_CHANNELS));
-    }
-    g_rr2_channel_mask = RR2_DAQ_GetChannelMask();
-
     if (g_rr2_online) {
-        /* Only the selected channels stay powered. An enabled channel
-         * feeds the NOR trigger whether or not a detector hangs off it,
-         * so leaving the empty ones on would trigger the DAQ on their
-         * own noise. */
-        g_rr2_cfg_status = RR2_Ctrl_ApplyChannelMask(g_rr2_channel_mask);
+        g_rr2_cfg_status = RR2_Ctrl_PushAll();
 
-        if (g_rr2_cfg_status == RR2_OK) {
-            g_rr2_cfg_status = RR2_Ctrl_PushAll();
-        }
         if (g_rr2_cfg_status == RR2_OK) {
             g_rr2_cfg_status = RR2_Ctrl_SetThresholds(300u, 500u, 200u);
         }
@@ -427,13 +358,12 @@ static uint8_t RR2_Bringup(void)
  * @brief Digitise one event after a trigger.
  *
  * The ASIC's delay cell has to finish asserting "hold" before the read
- * register may be clocked, so wait that out first.
+ * register may be clocked, so wait that out first. A full 64-channel
+ * readout takes roughly 64 x 6 us = 400 us, dominated by the ADC.
  *
- * How long this takes depends on the channel selection, because the
- * ADC dominates: all 64 channels costs roughly 64 x 6 us = 400 us,
- * while five selected channels costs about 50 us - the clocking still
- * walks the read register, but only five pairs of conversions happen.
- * See RR2_DETECTOR_CHANNELS above and the "sel" command.
+ * If only a few channels are instrumented, replace RR2_DAQ_ReadEvent
+ * with RR2_DAQ_ReadWindow(&g_rr2_event, first_ch, count) - it fast
+ * forwards past the unused channels and is far quicker.
  */
 static void RR2_ServiceEvent(void)
 {
@@ -486,7 +416,6 @@ static void USB_SendStatusPeriodic(void)
     if (HAL_GetTick() < s_status_next_ms) return;
     s_status_next_ms = HAL_GetTick() + 1000u;
 
-    st.channel_mask   = g_rr2_channel_mask;
     st.uptime_ms      = HAL_GetTick();
     st.trigger_count  = g_rr2_trigger_count;
     st.events_ok      = g_rr2_events_ok;
