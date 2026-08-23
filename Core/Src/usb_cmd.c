@@ -7,6 +7,7 @@
  */
 #include "usb_cmd.h"
 #include "radioroc2_ctrl.h"
+#include "radioroc2_daq.h"
 #include "rr2_i2ctest.h"
 #include "usb_stream.h"
 #include <string.h>
@@ -185,6 +186,10 @@ static void execute(void)
         reply_kv("dropped", (int32_t)USBStream_GetDropped());
         reply_kv("rx_overruns", (int32_t)overruns);
         reply_kv("format", (int32_t)USBStream_GetFormat());
+        /* What the readout will actually wait for before clocking
+           CK_READ, for the delay currently configured. Sanity check it
+           after 'preset csi': it must grow, not stay put.            */
+        reply_kv("hold_ns", (int32_t)RR2_DAQ_HoldDelayNs());
     }
     else if (arg_is(0u, "fmt")) {
         if (arg_is(1u, "txt")) {

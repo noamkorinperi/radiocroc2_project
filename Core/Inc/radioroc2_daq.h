@@ -41,9 +41,18 @@
 #define RR2_RSTN_READ_NS        100u   /* datasheet asks for >20 ns    */
 #define RR2_RESET_N_NS          100u   /* datasheet asks for ~20 ns    */
 
-/* Worst-case internal hold delay: delay(0xFF) * 0.85 ns * slopeTrim(4)
-   ~= 870 ns with our defaults. 3 us gives comfortable margin.         */
-#define RR2_HOLD_DELAY_NS      3000u
+/* The internal hold delay is NOT a constant: it is delay * 0.85 ns *
+   slopeTrim, and both terms are host settable. A fixed wait here was
+   sized for the power-on defaults (delay=255, slopeTrim=4 -> 870 ns)
+   and quietly became too short the moment anything stretched it -
+   PresetCsI asks for delay=255, slopeTrim=15, which is 3251 ns.
+   Starting CK_READ before hold is asserted samples peak detectors that
+   are still tracking, which smears the photopeak without ever failing.
+
+   So the wait is derived from the shadow instead, at every event. Only
+   these two margins are fixed:                                        */
+#define RR2_HOLD_DELAY_MIN_NS  1000u   /* floor, if the config says ~0 */
+#define RR2_HOLD_DELAY_PAD_NS  1000u   /* pad, on top of a +50% margin */
 
 /* ------------------------------------------------------------------ */
 /* One captured event                                                  */
@@ -69,8 +78,15 @@ void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg);
  *  is safe but slower. */
 uint8_t RR2_DAQ_IsTimingOk(void);
 
-/** Busy-wait for the ASIC's internal hold delay to elapse.            */
+/** Busy-wait for the ASIC's internal hold delay to elapse. Reads the
+ *  currently configured delay, so it stays correct after 'delay' or
+ *  'preset csi' change it at runtime.                                 */
 void RR2_DAQ_WaitHold(void);
+
+/** The wait RR2_DAQ_WaitHold() will perform, in ns, for the delay
+ *  currently held in the Slow Control shadow. Exposed so the host can
+ *  see what the readout is actually waiting for.                      */
+uint32_t RR2_DAQ_HoldDelayNs(void);
 
 /** Pulse RSTN_READ to rewind the read pointer to before channel 0.    */
 void RR2_DAQ_ResetReadPointer(void);

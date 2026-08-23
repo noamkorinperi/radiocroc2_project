@@ -6,6 +6,7 @@
  ******************************************************************************
  */
 #include "radioroc2_daq.h"
+#include "radioroc2_ctrl.h"  /* the shadow, to read back the hold delay */
 #include "main.h"     /* pin macros generated from the CubeMX User Labels */
 #include <stddef.h>
 
@@ -107,9 +108,28 @@ void RR2_DAQ_EndOfReadout(void)
     HAL_GPIO_WritePin(RESET_N_GPIO_Port, RESET_N_Pin, GPIO_PIN_SET);
 }
 
+uint32_t RR2_DAQ_HoldDelayNs(void)
+{
+    const RR2_Shadow *s = RR2_Ctrl_GetShadow();
+
+    /* delay * 0.85 ns * slopeTrim. The 85/100 keeps this in integers:
+       the DAQ path has no business pulling in soft float.             */
+    const uint32_t delay = (uint32_t)s->com_delay;                      /* 0..255 */
+    const uint32_t slope = (uint32_t)RR2_GET(RR2_SLOPETRIM, s->com_slope); /* 0..15 */
+
+    uint32_t ns = ((delay * slope * 85u) + 99u) / 100u;   /* round up */
+
+    if (ns < RR2_HOLD_DELAY_MIN_NS) ns = RR2_HOLD_DELAY_MIN_NS;
+
+    /* The datasheet figure is nominal and the delay cell has spread, so
+       wait half as long again plus a fixed pad. Overshooting only costs
+       dead time - the peak detectors hold until RESET_N either way.   */
+    return ns + (ns / 2u) + RR2_HOLD_DELAY_PAD_NS;
+}
+
 void RR2_DAQ_WaitHold(void)
 {
-    RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_HOLD_DELAY_NS));
+    RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_DAQ_HoldDelayNs()));
 }
 
 /* ------------------------------------------------------------------ */
