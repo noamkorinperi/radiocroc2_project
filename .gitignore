@@ -21,6 +21,10 @@ venv/
 *.csv
 *.xlsx
 *.bin
+/python/screenshots/
+
+# The handful of choices the GUI remembers between runs.
+/python/gui_prefs.json
 
 # ---------------------------------------------------------------
 # Editor / OS noise

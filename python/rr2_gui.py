@@ -12,6 +12,7 @@ Pages
 Requirements
     pyserial   pip install pyserial      (hardware link)
     openpyxl   pip install openpyxl      (Excel export; CSV fallback otherwise)
+    pillow     pip install pillow        (PNG screenshots)
 
 rr2_decode.py must sit next to this file - it owns the wire protocol so
 there is only one place to change if the framing ever moves.
@@ -22,6 +23,7 @@ Run without hardware:
 
 import argparse
 import csv
+import ctypes
 import json
 import os
 import queue
@@ -31,7 +33,7 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 # ---------------------------------------------------------------- protocol
 try:
@@ -53,10 +55,19 @@ try:
 except ImportError:
     HAVE_XLSX = False
 
+try:
+    from PIL import ImageGrab
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+
 
 ADC_MAX = 4095                      # 12-bit ADC
 STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "measurements")
 RAW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw")
+SHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+PREFS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "gui_prefs.json")
 
 # A thermal sweep is six temperature points, and it gets repeated. Six
 # slots meant the pedestal run was deleted on the way to the last point,
@@ -73,7 +84,30 @@ C_MUTED = "#6b7684"
 C_GRID = "#dfe4ea"
 C_BAR = "#1f6feb"
 C_OK = "#1a7f37"
+C_WARN = "#b26a00"
 C_BAD = "#c0392b"
+
+
+# ===================================================================
+#  Preferences - the few choices that should outlive a session
+# ===================================================================
+def load_prefs():
+    """Whatever was saved last time, or nothing. Never raises."""
+    try:
+        with open(PREFS_PATH, encoding="utf-8") as fh:
+            prefs = json.load(fh)
+        return prefs if isinstance(prefs, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_prefs(prefs):
+    """Best effort. A preference is not worth an error dialog."""
+    try:
+        with open(PREFS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(prefs, fh, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
 
 
 # ===================================================================
@@ -91,6 +125,20 @@ class Link:
         self._thread = None
         self._dec = Decoder()
         self._sim_state = {"rate": 180.0, "centre": 2400, "sigma": 90}
+        # An open port proves nothing - the ST-Link enumerates whether or
+        # not the firmware is running, and a wrong baud rate delivers
+        # bytes that are pure noise. These are what tell the difference.
+        self.rx_bytes = 0
+        self.rx_at = 0.0                   # monotonic time of the last byte
+
+    def stats(self):
+        """Counters that say whether the wire is healthy, not just open."""
+        return {
+            "rx_bytes": self.rx_bytes,
+            "rx_at": self.rx_at,
+            "bad_crc": self._dec.bad_crc,
+            "resyncs": self._dec.resyncs,
+        }
 
     # ---- connection -------------------------------------------------
     @staticmethod
@@ -121,6 +169,9 @@ class Link:
         self._start_reader(self._read_sim)
 
     def _start_reader(self, target):
+        self.rx_bytes = 0
+        self.rx_at = 0.0
+        self._dec = Decoder()
         self._stop.clear()
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
@@ -167,6 +218,8 @@ class Link:
                 return
             if not chunk:
                 continue
+            self.rx_bytes += len(chunk)
+            self.rx_at = time.monotonic()
             # Text replies and binary frames share the pipe. The decoder
             # sorts them: frames come back from feed(), and the bytes it
             # rejected are recovered as lines by take_text(). Draining
@@ -185,6 +238,8 @@ class Link:
         while not self._stop.is_set():
             time.sleep(0.02)
             now = time.time()
+            self.rx_bytes += 64
+            self.rx_at = time.monotonic()
             n = max(0, int(random.gauss(self._sim_state["rate"] * 0.02,
                                         self._sim_state["rate"] * 0.02 * 0.4)))
             for _ in range(n):
@@ -211,6 +266,332 @@ class Link:
                     "rr2_online": True, "temp_online": True,
                     "timing_ok": True, "cfg_status": 0, "read_status": 0,
                 })
+
+
+# ===================================================================
+#  Shadow register decoding
+# ===================================================================
+# Field positions mirror radioroc2_regs.h. Slow Control is write-only on
+# this board, so the firmware's shadow - what "ch N dump" prints - is the
+# only readback of the ASIC there is. Decoding it here is what lets a
+# saved run carry the settings it was taken under, instead of a promise
+# that the form on screen was the form that got pushed.
+
+def decode_channel(b):
+    """The eight per-channel shadow bytes, as named settings."""
+    if len(b) < 8:
+        return {}
+    sub6, sub7 = b[6], b[7]
+    return {
+        "inDac": b[0],
+        "patGain": b[1] & 0x3F,
+        "lgGain": (b[2] >> 4) & 0x0F,
+        "hgGain": b[2] & 0x0F,
+        "tauLG": (b[3] >> 4) & 0x0F,
+        "tauHG": b[3] & 0x0F,
+        "trimT1": b[4] & 0x3F,
+        "trimT2": b[5] & 0x3F,
+        "slowLG": bool(sub7 & 0x80),
+        "slowHG": bool(sub7 & 0x40),
+        "ctest": bool(sub7 & 0x10),
+        # The LG readout path end to end: preamp, shaper, peak detector.
+        # Any one of them off and the channel reports only a pedestal.
+        "lg_path_on": (bool(sub6 & 0x02) and bool(sub7 & 0x08)
+                       and bool(sub7 & 0x02)),
+        # Separate on purpose - a reference channel keeps its readout and
+        # loses only its right to fire the trigger.
+        "discri_on": bool(sub6 & 0x1C),
+    }
+
+
+def decode_globals(b):
+    """The eight global shadow bytes from the "glob:" line.
+
+    Order matches cmd_dump(): dac1_lo, dac2_dac1, dacq_dac2, dacq_hi,
+    delay, slope, hyst_trig, out_power.
+    """
+    if len(b) < 8:
+        return {}
+    dac1 = b[0] | ((b[1] & 0x03) << 8)
+    dac2 = ((b[1] >> 2) & 0x3F) | ((b[2] & 0x0F) << 6)
+    dacq = ((b[2] >> 4) & 0x0F) | ((b[3] & 0x3F) << 4)
+    return {
+        "dac1": dac1,
+        "dac2": dac2,
+        "dacq": dacq,
+        "hold_delay": b[4],
+        "slope_trim": (b[5] >> 4) & 0x0F,
+        "selTrig": b[6] & 0x0F,
+        "hold_external": bool(b[6] & 0x10),
+        "amux_lg": bool(b[7] & 0x01),
+        "abuffer": bool(b[7] & 0x08),
+    }
+
+
+class DeviceState:
+    """What the board last said about itself, in named values.
+
+    "stat" and "ch N dump" answer as bare text on the same UART as the
+    frames, so the recovered line is the only place those numbers exist
+    on this side. Parsing them once, here, means the console and the
+    saved record can both have them.
+    """
+
+    def __init__(self):
+        self.stat = {}                 # key=value pairs from "stat"
+        self.ch_raw = {}               # channel -> [8 shadow bytes]
+        self.glob_raw = []
+        self.stamp = 0.0               # monotonic time of the last update
+
+    def feed(self, line):
+        """Absorb one recovered text line. True if it was one of ours."""
+        line = line.strip()
+        if not line:
+            return False
+
+        # stat answers in bare key=value, one per line.
+        if "=" in line and " " not in line:
+            key, _, val = line.partition("=")
+            try:
+                self.stat[key] = int(val)
+            except ValueError:
+                self.stat[key] = val
+            self.stamp = time.monotonic()
+            return True
+
+        if line.startswith("glob:"):
+            vals = self._hex_after(line, ("glob:", "dac", "dly", "trig", "mux"))
+            if len(vals) >= 8:
+                self.glob_raw = vals[:8]
+                self.stamp = time.monotonic()
+                return True
+            return False
+
+        # "ch7: 80 20 40 EE 00 00 7F 8F"
+        if line.startswith("ch") and ":" in line:
+            head, _, rest = line.partition(":")
+            try:
+                ch = int(head[2:])
+            except ValueError:
+                return False
+            vals = self._hex_list(rest)
+            if len(vals) >= 8:
+                self.ch_raw[ch] = vals[:8]
+                self.stamp = time.monotonic()
+                return True
+        return False
+
+    @staticmethod
+    def _hex_list(text):
+        out = []
+        for word in text.split():
+            try:
+                out.append(int(word, 16))
+            except ValueError:
+                pass
+        return out
+
+    @classmethod
+    def _hex_after(cls, text, drop_words):
+        """Hex bytes of a line, ignoring the words that label them.
+
+        The glob line interleaves names with values - "dac 2C 4B ... dly
+        FF F0 ..." - so the words have to come out before the hex does.
+        Left in, "dac" itself parses as 0xDAC.
+        """
+        keep = " ".join(w for w in text.split()
+                        if w.lower() not in drop_words)
+        return cls._hex_list(keep)
+
+    def snapshot(self, channel=None):
+        """A frozen, JSON-safe copy of everything known about the board."""
+        out = {"stat": dict(self.stat)}
+        if self.glob_raw:
+            out["global"] = decode_globals(self.glob_raw)
+            out["global_raw"] = " ".join("%02X" % v for v in self.glob_raw)
+        if channel is not None and channel in self.ch_raw:
+            raw = self.ch_raw[channel]
+            out["channel"] = channel
+            out["channel_settings"] = decode_channel(raw)
+            out["channel_raw"] = " ".join("%02X" % v for v in raw)
+        return out
+
+    def has_dump(self, channel):
+        return channel in self.ch_raw and bool(self.glob_raw)
+
+
+# ===================================================================
+#  Link health
+# ===================================================================
+class LinkHealth:
+    """Is the link actually carrying data, or is the port merely open?
+
+    An open port proves only that the ST-Link enumerated. The firmware
+    is not necessarily running, the baud rate may be wrong, and a loose
+    wire delivers bytes that decode to nothing. The firmware sends a
+    status frame once a second whatever else is happening, so a missing
+    heartbeat is the one unambiguous sign that the link is down rather
+    than the source being quiet.
+    """
+
+    DEAD_S = 3.5          # heartbeats are 1 s apart; three missed is dead
+    LATE_S = 2.2          # one missed, and something is wrong
+    MISSED_BEAT_S = 1.8   # by the board's clock: a beat that never came
+    ERR_WINDOW_S = 10.0   # how long an error still counts against the link
+
+    OFFLINE, DEAD, UNSTABLE, OK = "offline", "dead", "unstable", "ok"
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.started_at = time.monotonic()   # when this link began
+        self.status_at = 0.0
+        self.event_at = 0.0
+        self.status_count = 0
+        self.event_count = 0
+        self.gap_worst = 0.0           # worst gap, by the board's clock
+        self.last_err_at = 0.0
+        self.err_note = ""
+        self.board = {}                # last status frame, as sent
+        self.dropped_delta = 0
+        self.bad_delta = 0
+        self._crc = 0
+        self._byte_at = 0.0
+
+    # -- inputs
+    def on_frame(self, frame):
+        now = time.monotonic()
+        kind = frame.get("type")
+        if kind == "event":
+            self.event_at = now
+            self.event_count += 1
+            return
+        if kind != "status":
+            return
+
+        self.status_at = now
+        self.status_count += 1
+
+        prev, self.board = self.board, dict(frame)
+
+        # Time the gap by the board's own clock, not this one. The frame
+        # carries the uptime it was built at, so a host that was busy
+        # repainting for two seconds and drained three frames at once
+        # does not get reported as a link that skipped a beat.
+        if prev:
+            gap = (frame.get("uptime_ms", 0) - prev.get("uptime_ms", 0)) / 1000.0
+            if gap < 0:
+                self._flag(now, "the board reset - uptime went backwards")
+            else:
+                self.gap_worst = max(self.gap_worst, gap)
+                if gap > self.MISSED_BEAT_S:
+                    self._flag(now, "the board skipped %.1f s of heartbeats"
+                                    % gap)
+
+        # Counters the firmware keeps for itself. Rising means the board
+        # is losing data on its own side, which no amount of port health
+        # on this side would ever show.
+        self.dropped_delta = (max(0, frame.get("dropped", 0)
+                                  - prev.get("dropped", 0)) if prev else 0)
+        self.bad_delta = (max(0, frame.get("events_bad", 0)
+                              - prev.get("events_bad", 0)) if prev else 0)
+        if self.dropped_delta:
+            self._flag(now, "%d frames dropped by the board"
+                            % self.dropped_delta)
+        if self.bad_delta:
+            self._flag(now, "%d failed readouts" % self.bad_delta)
+        if not frame.get("rr2_online", True):
+            self._flag(now, "ASIC offline - Slow Control is not answering")
+        if not frame.get("timing_ok", True):
+            self._flag(now, "DWT timing unavailable - hold delay is wrong")
+        if frame.get("cfg_status") or frame.get("read_status"):
+            self._flag(now, "ASIC error cfg=%s read=%s"
+                            % (frame.get("cfg_status"),
+                               frame.get("read_status")))
+
+    def on_stats(self, st):
+        """Decoder counters. A rising CRC count is a corrupt wire.
+
+        Resyncs are not counted: every text reply the firmware sends is
+        a resync, so they say nothing about the link's health.
+        """
+        self._byte_at = st.get("rx_at", 0.0)
+        crc = st.get("bad_crc", 0)
+        if crc > self._crc:
+            self._flag(time.monotonic(),
+                       "%d frames failed CRC" % (crc - self._crc))
+        self._crc = crc
+
+    def _flag(self, now, note):
+        self.last_err_at = now
+        self.err_note = note
+
+    # -- output
+    def level(self, connected):
+        if not connected:
+            return self.OFFLINE
+        now = time.monotonic()
+        if not self.status_at:
+            # No heartbeat yet. For the first few seconds after opening
+            # the port that is not a verdict, it is not knowing - the
+            # board may simply not have reached its next second.
+            if now - self.started_at < self.DEAD_S:
+                return self.UNSTABLE
+            return self.DEAD
+        age = now - self.status_at
+        if age > self.DEAD_S:
+            return self.DEAD
+        if age > self.LATE_S:
+            return self.UNSTABLE
+        if self.last_err_at and (now - self.last_err_at) < self.ERR_WINDOW_S:
+            return self.UNSTABLE
+        return self.OK
+
+    def heartbeat_age(self):
+        return (time.monotonic() - self.status_at) if self.status_at else None
+
+    def event_age(self):
+        return (time.monotonic() - self.event_at) if self.event_at else None
+
+    def summary(self, connected):
+        """The verdict, and the number standing behind it."""
+        lvl = self.level(connected)
+        age = self.heartbeat_age()
+        if lvl == self.OFFLINE:
+            return lvl, "no port open"
+        if lvl == self.DEAD:
+            if age is None:
+                # Bytes with no frame in them is a link that is talking
+                # and not being understood, which is a different fault
+                # from a link that is silent.
+                if self._byte_at > self.started_at:
+                    return lvl, ("bytes are arriving but none of them "
+                                 "decode - check the baud rate")
+                return lvl, ("nothing received - wrong port, or the "
+                             "firmware is not running")
+            return lvl, "no heartbeat for %.1f s" % age
+        if lvl == self.UNSTABLE:
+            if age is None:
+                return lvl, "waiting for the first heartbeat"
+            if self.err_note:
+                return lvl, self.err_note
+            return lvl, "heartbeat %.1f s late" % age
+        return lvl, ("heartbeat %.1f s ago, %d received"
+                     % (age, self.status_count))
+
+    def snapshot(self, connected):
+        """The link's own vital signs, to be saved with a measurement."""
+        lvl, why = self.summary(connected)
+        return {
+            "level": lvl,
+            "detail": why,
+            "status_frames": self.status_count,
+            "events_seen": self.event_count,
+            "worst_heartbeat_gap_s": round(self.gap_worst, 2),
+            "bad_crc": self._crc,
+            "board": {k: v for k, v in self.board.items() if k != "type"},
+        }
 
 
 # ===================================================================
@@ -284,20 +665,23 @@ class HistCanvas(tk.Canvas):
         h = self.winfo_height()
         return (self.PAD_L, self.PAD_T, w - self.PAD_R, h - self.PAD_B)
 
+    def clear_tip(self):
+        """Drop the hover readout - it has no business in a saved PNG."""
+        if self._tip:
+            self.delete(self._tip)
+            self._tip = None
+
     def _hover(self, event):
         if not self.hist or not self.hist.total:
             return
         x0, y0, x1, y1 = self._plot_box()
         if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
-            if self._tip:
-                self.delete(self._tip)
-                self._tip = None
+            self.clear_tip()
             return
         frac = (event.x - x0) / max(1, (x1 - x0))
         idx = min(self.hist.bins - 1, int(frac * self.hist.bins))
         adc = self.hist.centre_of(idx)
-        if self._tip:
-            self.delete(self._tip)
+        self.clear_tip()
         self._tip = self.create_text(
             x1 - 6, y0 + 6, anchor="ne", fill=C_MUTED,
             text=f"ADC {adc:.0f}   counts {self.hist.counts[idx]}",
@@ -384,6 +768,53 @@ class HistCanvas(tk.Canvas):
 
 
 # ===================================================================
+#  Link indicator
+# ===================================================================
+class HealthLight(ttk.Frame):
+    """A lamp and a sentence: is the link carrying data right now?
+
+    "Connected" used to mean the port opened, which is the one thing
+    that is true even when the board is unplugged mid-run, running the
+    wrong baud rate, or sitting in a reset loop. This watches the
+    once-a-second heartbeat instead.
+    """
+
+    DOT = 12
+    COLOURS = {
+        LinkHealth.OK: (C_OK, "link ok"),
+        LinkHealth.UNSTABLE: (C_WARN, "link unstable"),
+        LinkHealth.DEAD: (C_BAD, "no data"),
+        LinkHealth.OFFLINE: (C_MUTED, "offline"),
+    }
+
+    def __init__(self, master, detail=True, **kw):
+        super().__init__(master, **kw)
+        self.lamp = tk.Canvas(self, width=self.DOT + 2, height=self.DOT + 2,
+                              highlightthickness=0, bg=C_BG)
+        self.lamp.pack(side="left")
+        self._dot = self.lamp.create_oval(1, 1, self.DOT, self.DOT,
+                                          fill=C_MUTED, outline="")
+        self.lbl = ttk.Label(self, text="offline", style="Bad.TLabel")
+        self.lbl.pack(side="left", padx=(6, 0))
+        self.detail = ttk.Label(self, text="", style="Sub.TLabel") \
+            if detail else None
+        if self.detail:
+            self.detail.pack(side="left", padx=(10, 0))
+        self._level = None
+
+    def update_health(self, level, why):
+        colour, text = self.COLOURS.get(level, (C_MUTED, level))
+        if level != self._level:
+            self._level = level
+            self.lamp.itemconfigure(self._dot, fill=colour)
+            style = {LinkHealth.OK: "Ok.TLabel",
+                     LinkHealth.UNSTABLE: "Warn.TLabel"}.get(level, "Bad.TLabel")
+            self.lbl.configure(text=text, style=style)
+        if self.detail:
+            self.detail.configure(text=why)
+
+
+# ===================================================================
 #  Measurement records
 # ===================================================================
 def ensure_store():
@@ -428,6 +859,179 @@ def prune_measurements():
             pass
 
 
+# The order these come out in, and the words next to them. A saved run
+# is read by someone who no longer remembers what patGain was for, so
+# the units travel with the number.
+SETTING_UNITS = {
+    "inDac": "0-255, SiPM bias trim",
+    "lgGain": "0-15, x0.5-8",
+    "hgGain": "0-15, trigger only",
+    "tauLG": "0-15 shaping steps",
+    "tauHG": "0-15 shaping steps",
+    "slowLG": "1 = 120 ns steps",
+    "slowHG": "1 = 120 ns steps",
+    "patGain": "0-63, trigger gain",
+    "trimT1": "0-63, below DAC1",
+    "trimT2": "0-63, below DAC2",
+    "ctest": "charge injection",
+    "lg_path_on": "LG readout powered",
+    "discri_on": "may fire the trigger",
+    "dac1": "0-1023, T1 threshold",
+    "dac2": "0-1023, T2 threshold",
+    "dacq": "0-1023, charge thr.",
+    "hold_delay": "0-255, x0.85 ns x slope",
+    "slope_trim": "0-15, x hold delay",
+    "selTrig": "trigger source",
+    "hold_external": "1 = HOLDEXT pin",
+    "amux_lg": "0 = ADC reads nothing",
+    "abuffer": "output buffer supply",
+    "hold_ns": "readout wait, ns",
+    "dropped": "frames lost by board",
+    "pending": "frames queued",
+    "rx_overruns": "cmd bytes lost",
+    "format": "0 = binary, 1 = text",
+}
+
+# Which form field answers which register, for the disagreement check.
+_FORM_VS_CHANNEL = ("inDac", "lgGain", "tauLG", "slowLG", "patGain",
+                    "trimT1", "trimT2")
+_FORM_VS_GLOBAL = ("dac1", "dac2", "dacq", "hold_delay", "slope_trim",
+                   "selTrig", "hold_external", "amux_lg")
+
+
+def _rows(d, keys=None):
+    """(key, value, note) rows for a settings dict, units attached."""
+    items = [(k, d[k]) for k in keys] if keys else list(d.items())
+    out = []
+    for k, v in items:
+        if isinstance(v, bool):
+            v = int(v)
+        out.append((k, v, SETTING_UNITS.get(k, "")))
+    return out
+
+
+def settings_sections(rec):
+    """The saved settings of one record, grouped and ready to print.
+
+    Returns [(title, [(key, value, note), ...]), ...]. Records written
+    before the settings were captured simply come back with fewer
+    sections, so old files still open.
+    """
+    s = rec.get("settings")
+    out = []
+    if not isinstance(s, dict):
+        # Pre-snapshot record: everything that is known is at top level.
+        out.append(("Acquisition", _rows({
+            "channel": rec.get("channel", ""),
+            "source": rec.get("source", ""),
+            "bins": rec.get("bins", ""),
+            "lo": rec.get("lo", ""),
+            "hi": rec.get("hi", ""),
+        })))
+        if s:
+            out.append(("Settings", [("settings", s, "")]))
+        return out
+
+    acq = s.get("acquisition") or {}
+    if acq:
+        out.append(("Acquisition", _rows(acq)))
+
+    dev = s.get("device") or {}
+    form = s.get("form") or {}
+
+    if "unavailable" in dev:
+        out.append(("ASIC registers", [("read back", "no", dev["unavailable"])]))
+    else:
+        chs = dev.get("channel_settings") or {}
+        if chs:
+            title = "ASIC channel %s, read back from the board" % dev.get("channel")
+            rows = _rows(chs, [k for k in ("inDac", "lgGain", "hgGain",
+                                           "tauLG", "tauHG", "slowLG",
+                                           "slowHG", "patGain", "trimT1",
+                                           "trimT2", "ctest", "lg_path_on",
+                                           "discri_on") if k in chs])
+            if dev.get("channel_raw"):
+                rows.append(("shadow bytes", dev["channel_raw"],
+                             "subadd 0-7"))
+            out.append((title, rows))
+        glob = dev.get("global") or {}
+        if glob:
+            rows = _rows(glob, [k for k in ("dac1", "dac2", "dacq",
+                                            "hold_delay", "slope_trim",
+                                            "selTrig", "hold_external",
+                                            "amux_lg", "abuffer")
+                                if k in glob])
+            if dev.get("global_raw"):
+                rows.append(("shadow bytes", dev["global_raw"],
+                             "dacs, delay, trig, power"))
+            out.append(("ASIC global, read back from the board", rows))
+        stat = dev.get("stat") or {}
+        if stat:
+            out.append(("Firmware status at the start of the run",
+                        _rows(stat)))
+
+    if form:
+        out.append(("Settings page, as it stood", _rows(form)))
+        # Where the two disagree, the form was edited and never applied.
+        # That is exactly the mistake this snapshot exists to catch.
+        diffs = []
+        chs = dev.get("channel_settings") or {}
+        glob = dev.get("global") or {}
+        if str(form.get("ui_channel")) == str(dev.get("channel")):
+            for k in _FORM_VS_CHANNEL:
+                if k in chs and k in form and int(chs[k]) != int(form[k]):
+                    diffs.append((k, "form %s, chip %s" % (form[k], chs[k]),
+                                  "not applied"))
+        for k in _FORM_VS_GLOBAL:
+            if k in glob and k in form and int(glob[k]) != int(form[k]):
+                diffs.append((k, "form %s, chip %s" % (form[k], glob[k]),
+                              "not applied"))
+        if diffs:
+            out.append(("Form and chip disagree - the chip wins", diffs))
+
+    link = rec.get("link") or {}
+    if link:
+        end = link.get("at_end") or {}
+        rows = [("verdict", end.get("level", "?"), end.get("detail", "")),
+                ("events received", link.get("events_in_run", ""), ""),
+                ("status frames", end.get("status_frames", ""),
+                 "one per second"),
+                ("worst beat gap", end.get("worst_heartbeat_gap_s", ""),
+                 "s by board clock"),
+                ("frames failing CRC", end.get("bad_crc", ""),
+                 "a corrupt wire")]
+        board = end.get("board") or {}
+        for k in ("triggers", "events_ok", "events_bad", "dropped"):
+            if k in board:
+                rows.append((k, board[k], "board counter"))
+        out.append(("Link health", rows))
+
+    return out
+
+
+def link_verdict(rec):
+    """How the link behaved during a saved run, in one word.
+
+    Records written before the link was tracked say so, rather than
+    claiming a clean bill of health they never had.
+    """
+    link = rec.get("link") or {}
+    end = link.get("at_end") or {}
+    return end.get("level", "-")
+
+
+def settings_text(rec):
+    """The settings sections as a block of text, for reading on screen."""
+    lines = []
+    for title, rows in settings_sections(rec):
+        lines.append(title)
+        lines.append("-" * len(title))
+        for key, val, note in rows:
+            lines.append("  %-18s %-10s %s" % (key, val, note))
+        lines.append("")
+    return "\n".join(lines) if lines else "no settings were saved with this run"
+
+
 def export_measurement(rec, path):
     """Write one measurement to .xlsx, or CSV if openpyxl is missing."""
     counts = rec["counts"]
@@ -437,9 +1041,15 @@ def export_measurement(rec, path):
     if not HAVE_XLSX or path.lower().endswith(".csv"):
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            for k in ("started", "duration_s", "channel", "source",
-                      "total", "overflow", "temp_c", "note"):
+            for k in ("started", "label", "duration_s", "channel", "source",
+                      "total", "overflow", "temp_c", "rate_cps", "raw_file",
+                      "note"):
                 w.writerow([k, rec.get(k, "")])
+            for title, rows in settings_sections(rec):
+                w.writerow([])
+                w.writerow([title])
+                for key, val, note in rows:
+                    w.writerow([key, val, note])
             w.writerow([])
             w.writerow(["bin", "adc_low", "adc_high", "adc_centre", "counts"])
             for i, c in enumerate(counts):
@@ -467,14 +1077,209 @@ def export_measurement(rec, path):
     ws.add_chart(chart, "G2")
 
     meta = wb.create_sheet("Metadata")
+    meta.append(["Run"])
     for k in ("started", "label", "duration_s", "channel", "source",
               "bins", "lo", "hi", "total", "overflow", "temp_c", "rate_cps",
-              "raw_file", "note", "settings"):
+              "raw_file", "note"):
         meta.append([k, str(rec.get(k, ""))])
     meta.append([])
     meta.append(["axis", "raw ADC counts on OUT_AMUXLG"])
+    # One row per setting. A blob in a single cell is not something a
+    # thermal sweep can be sorted or plotted against afterwards.
+    for title, rows in settings_sections(rec):
+        meta.append([])
+        meta.append([title])
+        for key, val, note in rows:
+            meta.append([key, val if not isinstance(val, bool) else int(val),
+                         note])
+    meta.column_dimensions["A"].width = 24
+    meta.column_dimensions["B"].width = 22
+    meta.column_dimensions["C"].width = 48
 
     wb.save(path)
+
+
+def safe_label(text):
+    """A run label as a filename fragment. Shared by the raw log and the
+    screenshots so one run's files sort together."""
+    return "".join(c if (c.isalnum() or c in "._-") else "_"
+                   for c in text.strip())
+
+
+# ===================================================================
+#  Screenshots
+# ===================================================================
+def shot_path(kind, label=""):
+    """A fresh PNG path under screenshots/, named like the raw files."""
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lab = safe_label(label)
+    return os.path.join(SHOT_DIR,
+                        f"{kind}_{stamp}_{lab}.png" if lab
+                        else f"{kind}_{stamp}.png")
+
+
+def widget_box(widget):
+    """Screen rectangle of one widget, in Tk's coordinates."""
+    x, y = widget.winfo_rootx(), widget.winfo_rooty()
+    return (x, y, x + widget.winfo_width(), y + widget.winfo_height())
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE. The same one Pillow borrows
+# before it grabs, so the numbers below come from the space its image
+# is in.
+_PER_MONITOR_DPI = -3
+
+
+def _window_rect(root):
+    """This window's rectangle, in whatever space the thread is in."""
+    r = _RECT()
+    ctypes.windll.user32.GetWindowRect(ctypes.c_void_p(root.winfo_id()),
+                                       ctypes.byref(r))
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def _dpi_aware(fn):
+    """Run fn() with this thread temporarily per-monitor DPI aware.
+
+    On Windows 8.1 and earlier the call does not exist, and fn() simply
+    runs in the virtualised space. Nothing needs special handling: those
+    Pillows grab virtualised pixels too, so the two spaces are already
+    the same one and the ratio below comes out at 1.
+    """
+    try:
+        set_ctx = ctypes.windll.user32.SetThreadDpiAwarenessContext
+    except (AttributeError, OSError):
+        return fn()
+    set_ctx.argtypes = [ctypes.c_void_p]
+    set_ctx.restype = ctypes.c_void_p
+    prev = set_ctx(ctypes.c_void_p(_PER_MONITOR_DPI))
+    if not prev:                            # the context was refused
+        return fn()
+    try:
+        return fn()
+    finally:
+        set_ctx(ctypes.c_void_p(prev))
+
+
+def screen_map(root, shot_size, whole_desktop=True):
+    """A function mapping a Tk (x, y) to a pixel in a grab of the screen.
+
+    Tk is not DPI aware, so Windows hands it virtualised coordinates,
+    while Pillow grabs the framebuffer under per-monitor awareness and
+    gets real ones. On a mixed-DPI desktop those two are not a uniform
+    scaling of each other: a 200% laptop reports 1440x900 for a
+    2880x1800 panel, while a 100% monitor beside it reports its true
+    2560x1080 - so the desktop measures 5440x1080 as Tk sees it and
+    5440x1800 as Pillow does. Dividing one by the other gives a factor
+    of 1.0 across and 1.67 down, and a crop computed from that lands
+    nowhere near the widget.
+
+    What does work is calibrating on a rectangle that exists in both
+    spaces - this window's - measured once as Tk has it and once with
+    the thread borrowed into the awareness the grab happens under. The
+    ratio is then exact, and it is the right one for whichever monitor
+    the window is actually on.
+    """
+    def uniform():
+        # One screen, one scale, and the grab itself reports it: a
+        # Retina capture comes back at twice the size Tk claims.
+        wide = root.winfo_screenwidth() or shot_size[0]
+        k = shot_size[0] / float(wide)
+        return lambda x, y: (round(x * k), round(y * k))
+
+    if sys.platform != "win32" or not whole_desktop:
+        return uniform()
+
+    try:
+        tk_x, tk_y = root.winfo_rootx(), root.winfo_rooty()
+        tk_w = root.winfo_width()
+        real, virt = _dpi_aware(
+            lambda: (_window_rect(root),
+                     (ctypes.windll.user32.GetSystemMetrics(76),
+                      ctypes.windll.user32.GetSystemMetrics(77))))
+    except Exception:
+        return uniform()
+
+    if tk_w < 1 or real[2] <= real[0]:
+        return uniform()
+
+    k = (real[2] - real[0]) / float(tk_w)
+    return lambda x, y: (round((x - tk_x) * k + real[0] - virt[0]),
+                         round((y - tk_y) * k + real[1] - virt[1]))
+
+
+def _front(root, on):
+    """Hold the window above everything else for the length of a grab.
+
+    This is a screen grab, so it takes whatever is on the glass: a file
+    manager left open over the plot ends up in the PNG instead of the
+    plot. Raising first is the only reliable defence.
+    """
+    try:
+        if on:
+            root.lift()
+        root.attributes("-topmost", bool(on))
+        root.update()
+        if on:
+            time.sleep(0.15)                # let the desktop repaint
+            root.update()
+    except tk.TclError:                     # window manager said no
+        pass
+
+
+def grab_widgets(widgets, path, pad=0):
+    """Save the rectangle covering `widgets` as a PNG, and return the path.
+
+    `pad` adds breathing room around the widgets, never past the edge of
+    the window - a margin of desktop wallpaper is not part of the plot.
+    """
+    if not HAVE_PIL:
+        raise RuntimeError("Screenshots need Pillow.\n\n"
+                           "    pip install pillow")
+    root = widgets[0].winfo_toplevel()
+    root.update_idletasks()                 # flush any pending redraw
+    if not widgets[0].winfo_viewable():
+        raise RuntimeError("The window is not on screen.")
+
+    try:
+        _front(root, True)
+        # Measured after the raise: lifting a window can move it.
+        boxes = [widget_box(w) for w in widgets]
+        box = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+               max(b[2] for b in boxes), max(b[3] for b in boxes))
+        if pad:
+            win = widget_box(root)
+            box = (max(box[0] - pad, win[0]), max(box[1] - pad, win[1]),
+                   min(box[2] + pad, win[2]), min(box[3] + pad, win[3]))
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+            raise RuntimeError("Nothing to capture.")
+        try:
+            # all_screens: the whole desktop, so a window on the second
+            # monitor is in the picture and not off the edge of it.
+            shot = ImageGrab.grab(all_screens=True)
+            to_px = screen_map(root, shot.size)
+        except TypeError:
+            # Pillow older than 6.2: no all_screens, and no DPI
+            # awareness either, so its grab is in Tk's own coordinates
+            # and the primary screen is all there is.
+            shot = ImageGrab.grab()
+            to_px = screen_map(root, shot.size, whole_desktop=False)
+    finally:
+        _front(root, False)                 # never leave it pinned on top
+
+    # Tk coordinates -> pixels in that image. Cropping without the
+    # conversion lands up and left of the widget on any scaled display.
+    left, top = to_px(box[0], box[1])
+    right, bottom = to_px(box[2], box[3])
+    img = shot.crop((left, top, right, bottom))
+    img.save(path, "PNG")
+    return path
 
 
 # ===================================================================
@@ -525,6 +1330,16 @@ class PageMain(Page):
         self.lbl_state = ttk.Label(conn, text="offline", style="Bad.TLabel")
         self.lbl_state.grid(row=0, column=6, padx=12)
 
+        # The row above says whether a port is open. This one says
+        # whether anything is coming out of it, which is the question
+        # that actually decides if a measurement is worth starting.
+        row1 = ttk.Frame(conn)
+        row1.grid(row=1, column=0, columnspan=7, sticky="w", pady=(10, 0))
+        self.light = HealthLight(row1)
+        self.light.pack(side="left")
+        ttk.Button(row1, text="Test link", command=self.test_link)\
+            .pack(side="left", padx=(18, 0))
+
         # navigation tiles
         nav = ttk.Frame(self)
         nav.pack(fill="both", expand=True, pady=16)
@@ -536,8 +1351,8 @@ class PageMain(Page):
                          "thresholds, per-channel enables", "settings"),
             ("Measure", "Run an acquisition and watch the\n"
                         "spectrum accumulate live", "measure"),
-            ("History", "The last six measurements,\n"
-                        "with export to Excel", "history"),
+            ("History", "Saved runs, the settings they were\n"
+                        "taken under, and export to Excel", "history"),
             ("Help", "How the system works and the\n"
                      "order to do things in", "help"),
         ]
@@ -589,9 +1404,37 @@ class PageMain(Page):
         self.app.link.close()
         self.app.set_state(False, "")
 
+    def test_link(self):
+        """Ask the board a question and see whether it answers.
+
+        The heartbeat proves the board is transmitting. This proves it is
+        also listening - a half-working link, where commands go nowhere
+        but frames keep arriving, otherwise looks perfectly healthy right
+        up until the moment a setting silently fails to apply.
+        """
+        if not self.app.link.connected:
+            messagebox.showwarning("Offline", "Connect to the board first.")
+            return
+        before = self.app.state.stamp
+        self.app.link.send("stat")
+        self.app.toast("test: asked the board for 'stat' ...")
+        self.after(700, lambda: self._test_result(before))
+
+    def _test_result(self, before):
+        if self.app.state.stamp > before:
+            hold = self.app.state.stat.get("hold_ns")
+            self.app.toast("test: the board replied"
+                           + (f" (hold {hold} ns)" if hold else ""))
+        elif self.app.link.sim:
+            self.app.toast("test: the simulator does not answer commands")
+        else:
+            self.app.toast("test: no reply - commands are not getting "
+                           "through, even if frames are")
+
     def on_show(self):
         self.refresh_ports()
         self.app.refresh_state_labels()
+        self.app.refresh_health()
 
 
 class PageSettings(Page):
@@ -754,6 +1597,33 @@ class PageSettings(Page):
         self.cmd(f"hold {'ext' if self.v_hold_ext.get() else 'int'}")
         self.cmd(f"mux {self.v_mlg.get()}")
 
+    def form_values(self):
+        """Everything on this page, as a dict.
+
+        What the form holds is not necessarily what the ASIC holds - the
+        page can be edited without ever pressing Apply, and Defaults
+        resets the chip behind its back. So this is saved next to the
+        board's own shadow, never instead of it.
+        """
+        return {
+            "ui_channel": self.v_ch.get(),
+            "inDac": self.v_indac.get(),
+            "lgGain": self.v_glg.get(),
+            "tauLG": self.v_tlg.get(),
+            "slowLG": bool(self.v_slg.get()),
+            "patGain": self.v_pat.get(),
+            "trimT1": self.v_t1.get(),
+            "trimT2": self.v_t2.get(),
+            "dac1": self.v_d1.get(),
+            "dac2": self.v_d2.get(),
+            "dacq": self.v_dq.get(),
+            "hold_delay": self.v_dly.get(),
+            "slope_trim": self.v_slp.get(),
+            "selTrig": self.v_trig.get(),
+            "hold_external": bool(self.v_hold_ext.get()),
+            "amux_lg": bool(self.v_mlg.get()),
+        }
+
     def preset_csi(self):
         self.cmd("preset csi")
         # Mirror what the firmware preset does, so the form stays honest.
@@ -832,8 +1702,15 @@ class PageMeasure(Page):
         self.v_raw = tk.IntVar(value=1)
         ttk.Checkbutton(bar, text="log raw events", variable=self.v_raw)\
             .pack(side="left")
+        # Read this before pressing Start. A run that quietly stops
+        # receiving looks exactly like a run with no source in front of
+        # it, and only the heartbeat tells the two apart.
+        self.light = HealthLight(bar)
+        self.light.pack(side="left", padx=(24, 0))
         ttk.Button(bar, text="Save measurement", command=self.save)\
             .pack(side="right")
+        ttk.Button(bar, text="Save plot PNG", command=self.shot_plot)\
+            .pack(side="right", padx=6)
 
         self.canvas = HistCanvas(self, height=340)
         self.canvas.pack(fill="both", expand=True, pady=12)
@@ -853,17 +1730,37 @@ class PageMeasure(Page):
         self.raw_writer = None
         self.raw_path = ""
         self.raw_rows = 0
+        # The board's own account of its settings, frozen at the moment
+        # the run started - see _capture_settings().
+        self.dev_snapshot = None
+        self.snap_ch = None
+        self.form_snapshot = None
+        self.link_at_start = None
+        self.events_at_start = 0
 
     # -- control
     def start(self):
         if not self.app.link.connected:
             messagebox.showwarning("Offline", "Connect to the board first.")
             return
+        level, why = self.app.health.summary(True)
+        if level in (LinkHealth.DEAD, LinkHealth.UNSTABLE):
+            if not messagebox.askyesno(
+                    "Link is not healthy",
+                    f"The link reports: {level} - {why}\n\n"
+                    "A run started now may record nothing, or may lose "
+                    "events without saying so.\n\nStart anyway?"):
+                return
         self.hist.reset(self.v_bins.get(), 0, ADC_MAX)
         self.canvas.set_hist(self.hist)
         self._open_raw()
         self.running = True
         self.t_start = time.time()
+        self.dev_snapshot = None
+        self.form_snapshot = self.app.pages["settings"].form_values()
+        self.link_at_start = self.app.health.snapshot(True)
+        self.events_at_start = self.app.health.event_count
+        self._ask_settings()
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
 
@@ -873,6 +1770,29 @@ class PageMeasure(Page):
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
 
+    # -- settings snapshot
+    def _ask_settings(self):
+        """Ask the board for its shadow, so the run can be saved with it.
+
+        Both replies are plain text and arrive a few milliseconds later,
+        through the same queue as everything else; _capture_settings()
+        picks them up. Asking at the start and freezing the answer is
+        what keeps the record honest if the Settings page is edited
+        halfway through a run.
+        """
+        # Remember which channel was asked about: the spinbox can be
+        # moved mid-run, and the answer coming back is about this one.
+        self.snap_ch = self.v_ch.get()
+        self.app.state.ch_raw.pop(self.snap_ch, None)
+        self.app.state.glob_raw = []
+        self.app.link.send("stat")
+        self.app.link.send(f"ch {self.snap_ch} dump")
+
+    def _capture_settings(self):
+        """Freeze the board's answer, once, and stop watching for it."""
+        if self.dev_snapshot is None and self.snap_ch is not None                 and self.app.state.has_dump(self.snap_ch):
+            self.dev_snapshot = self.app.state.snapshot(self.snap_ch)
+
     # -- raw event log
     def _open_raw(self):
         self._close_raw()
@@ -881,8 +1801,7 @@ class PageMeasure(Page):
             self.raw_path = ""
             return
         os.makedirs(RAW_DIR, exist_ok=True)
-        label = "".join(c if (c.isalnum() or c in "._-") else "_"
-                        for c in self.v_label.get().strip())
+        label = safe_label(self.v_label.get())
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         name = f"raw_{stamp}_{label}.csv" if label else f"raw_{stamp}.csv"
         self.raw_path = os.path.join(RAW_DIR, name)
@@ -913,6 +1832,15 @@ class PageMeasure(Page):
         self.canvas.redraw()
         self.lbl.configure(text="cleared")
 
+    # -- screenshot
+    def shot_plot(self):
+        """PNG of the spectrum plus the line of numbers under it - the
+        counts, the rate and the temperature are what make the picture
+        mean something in a logbook."""
+        self.canvas.clear_tip()
+        self.app.screenshot([self.canvas, self.lbl],
+                            label=self.v_label.get(), kind="spectrum")
+
     def feed(self, frame):
         """Called by the app pump for every decoded frame."""
         if frame["type"] == "status":
@@ -941,6 +1869,7 @@ class PageMeasure(Page):
     def tick(self):
         if not self.running:
             return
+        self._capture_settings()
         elapsed = time.time() - self.t_start
         dur = self.v_dur.get()
         if dur and elapsed >= dur:
@@ -969,13 +1898,59 @@ class PageMeasure(Page):
             self.lbl.configure(
                 text=f"running {elapsed:6.1f} s | {self.hist.total} counts | "
                      f"{rate:6.1f} cps | {pk_txt} | T {self.last_temp:.1f} C | "
-                     f"overflow {self.hist.overflow}{raw_txt}")
+                     f"overflow {self.hist.overflow}{raw_txt}"
+                     + self._silence_note(elapsed))
+
+    def _silence_note(self, elapsed):
+        """Why nothing is arriving, when nothing is arriving.
+
+        Two very different faults look identical on an empty histogram:
+        a link that has stopped, and a threshold set above every pulse.
+        The heartbeat separates them, so say which one it is.
+        """
+        level = self.app.health.level(self.app.link.connected)
+        if level in (LinkHealth.DEAD, LinkHealth.OFFLINE):
+            return "   <<  LINK DOWN - these seconds are not being recorded"
+        age = self.app.health.event_age()
+        quiet = (age is None and elapsed > 5.0) or (age is not None and age > 5.0)
+        if quiet:
+            return ("   <<  link ok, no events - threshold, channel enable, "
+                    "or no source")
+        if level == LinkHealth.UNSTABLE:
+            return "   <<  link unstable - counts may be missing"
+        return ""
+
+    def _settings_block(self):
+        """Everything the run was taken under, as one saveable dict."""
+        ch = self.v_ch.get()
+        device = self.dev_snapshot
+        if device is None:
+            device = {"unavailable": (
+                "the simulator does not report registers"
+                if self.app.link.sim else
+                "the board did not answer 'ch %s dump' at the start of "
+                "the run" % self.snap_ch)}
+        return {
+            "device": device,
+            "form": self.form_snapshot or {},
+            "acquisition": {
+                "channel": ch,
+                "source": "OUT_AMUXLG",
+                "bins": self.hist.bins,
+                "lo": self.hist.lo,
+                "hi": self.hist.hi,
+                "duration_set_s": self.v_dur.get(),
+                "raw_logging": bool(self.v_raw.get()),
+            },
+        }
 
     def save(self):
         if self.hist.total == 0:
             messagebox.showinfo("Nothing to save", "Acquire some data first.")
             return
+        self._capture_settings()        # in case the reply landed late
         elapsed = (time.time() - self.t_start) if self.t_start else 0.0
+        link_now = self.app.health.snapshot(self.app.link.connected)
         rec = {
             "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "duration_s": round(elapsed, 1),
@@ -992,10 +1967,27 @@ class PageMeasure(Page):
             "label": self.v_label.get().strip(),
             "raw_file": os.path.basename(self.raw_path) if self.raw_path else "",
             "note": "simulator" if self.app.link.sim else "",
-            "settings": "",
+            "settings": self._settings_block(),
+            # Saved as evidence, not decoration: a spectrum taken across
+            # a link that dropped frames is a spectrum with a hole in it,
+            # and six months later nothing else will remember.
+            "link": {
+                "at_start": self.link_at_start or {},
+                "at_end": link_now,
+                "events_in_run": max(0, self.app.health.event_count
+                                     - self.events_at_start),
+            },
         }
         save_measurement(rec)
-        messagebox.showinfo("Saved", "Measurement stored in History.")
+        note = "Measurement stored in History."
+        if link_now.get("level") != LinkHealth.OK:
+            note += ("\n\nNote: the link was reported as "
+                     f"{link_now.get('level')} - {link_now.get('detail')}")
+        if isinstance(rec["settings"]["device"], dict) \
+                and "unavailable" in rec["settings"]["device"]:
+            note += ("\n\nThe ASIC registers could not be read back, so "
+                     "only the values from the Settings form were saved.")
+        messagebox.showinfo("Saved", note)
         self.app.pages["history"].reload()
 
 
@@ -1012,29 +2004,60 @@ class PageHistory(Page):
         ttk.Button(top, text="Refresh", command=self.reload).pack(side="right")
 
         cols = ("started", "label", "duration_s", "channel", "total",
-                "rate_cps", "temp_c", "overflow")
+                "rate_cps", "temp_c", "overflow", "link")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
-        widths = (150, 150, 80, 70, 90, 90, 80, 80)
+        widths = (150, 140, 80, 70, 90, 90, 70, 75, 80)
         for c, w in zip(cols, widths):
             self.tree.heading(c, text=c.replace("_", " "))
             self.tree.column(c, width=w, anchor="center")
         self.tree.pack(fill="x", pady=12)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.preview())
 
-        self.canvas = HistCanvas(self, height=280)
-        self.canvas.pack(fill="both", expand=True)
-
+        # This bar is packed before the plot, and from the bottom. The
+        # page asks for more height than the window has, and the packer
+        # starves whatever comes last: these buttons, Export included.
         bar = ttk.Frame(self)
-        bar.pack(fill="x", pady=10)
+        bar.pack(fill="x", side="bottom", pady=10)
         ttk.Button(bar, text="Export to Excel", style="Accent.TButton",
                    command=self.export).pack(side="left")
-        ttk.Button(bar, text="Delete", command=self.delete)\
+        ttk.Button(bar, text="Save plot PNG", command=self.shot_plot)\
             .pack(side="left", padx=6)
+        ttk.Button(bar, text="Delete", command=self.delete)\
+            .pack(side="left")
         self.lbl = ttk.Label(bar, text="", style="Sub.TLabel")
         self.lbl.pack(side="left", padx=16)
 
+        # Plot on the left, the numbers it was taken under on the right.
+        # Saving the settings and then having nowhere to read them would
+        # be half a feature.
+        split = ttk.Frame(self)
+        split.pack(fill="both", expand=True)
+        self.canvas = HistCanvas(split, height=280)
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        det = ttk.LabelFrame(split, text="Settings for this run", padding=6)
+        det.pack(side="right", fill="both", padx=(10, 0))
+        self.det = tk.Text(det, width=54, height=12, wrap="word",
+                           relief="flat", bg=C_PANEL, fg=C_TEXT,
+                           font=("Consolas", 9))
+        self.det.pack(side="left", fill="both", expand=True)
+        dsb = ttk.Scrollbar(det, command=self.det.yview)
+        dsb.pack(side="right", fill="y")
+        self.det.configure(yscrollcommand=dsb.set, state="disabled")
+        # A wrapped note that restarts at column 0 destroys the columns
+        # it was wrapping out of. Indent the continuation to where the
+        # note began, so a long row still reads as one row.
+        f = tkfont.Font(font=self.det.cget("font"))
+        self.det.tag_configure("row", lmargin2=f.measure(" " * 31))
+
         self.records = []
         self.reload()
+
+    def show_settings(self, text):
+        self.det.configure(state="normal")
+        self.det.delete("1.0", "end")
+        self.det.insert("1.0", text, "row")
+        self.det.configure(state="disabled")
 
     def reload(self):
         self.records = load_measurements()
@@ -1046,8 +2069,10 @@ class PageHistory(Page):
                 r.get("duration_s", ""),
                 r.get("channel", ""), r.get("total", ""),
                 r.get("rate_cps", ""), r.get("temp_c", ""),
-                r.get("overflow", "")))
+                r.get("overflow", ""), link_verdict(r)))
         self.canvas.set_hist(None)
+        self.show_settings("select a measurement to see the settings it "
+                           "was taken under")
         self.lbl.configure(
             text="" if HAVE_XLSX else "openpyxl not installed - export falls back to CSV")
 
@@ -1065,6 +2090,16 @@ class PageHistory(Page):
         h.counts = rec["counts"][:]
         h.total = rec.get("total", sum(h.counts))
         self.canvas.set_hist(h)
+        self.show_settings(settings_text(rec))
+
+    def shot_plot(self):
+        rec = self.selected()
+        if not rec:
+            messagebox.showinfo("Pick one", "Select a measurement first.")
+            return
+        self.canvas.clear_tip()
+        self.app.screenshot(self.canvas, label=rec.get("label", ""),
+                            kind="spectrum")
 
     def export(self):
         rec = self.selected()
@@ -1110,13 +2145,13 @@ class PageHelp(Page):
 WHAT THIS IS
     A front end for a RADIOROC2 based gamma spectrometer: a CsI(Tl)
     crystal read out by a SiPM, digitised by an STM32F722 and streamed
-    to this PC over the USB virtual COM port.
+    to this PC over the ST-Link virtual COM port.
 
 ORDER OF OPERATIONS
     1. Connect
-       Main page, pick the port, press Connect. If the board is not
-       built yet, press Simulator to explore the interface with
-       generated data.
+       Main page, pick the port, press Connect, and check that the lamp
+       under it goes green. If the board is not built yet, press
+       Simulator to explore the interface with generated data.
 
     2. Settings
        - Disable every channel first (Channel = all, then Disable).
@@ -1129,6 +2164,8 @@ ORDER OF OPERATIONS
          collected and the energy resolution collapses.
        - Set the thresholds. Too low and the system free-runs on noise,
          too high and you lose the low energy part of the spectrum.
+       - Press Apply. Nothing on this page reaches the chip until you
+         do, and the saved record will say so if you forget.
 
     3. Measure
        Choose the channel, set the bin count and a duration, then
@@ -1136,19 +2173,212 @@ ORDER OF OPERATIONS
        looks reasonable.
 
     4. History
-       The six most recent measurements are kept. Select one to preview
-       it, then Export to Excel.
+       Select a run to preview it and read the settings it was taken
+       under, then Export to Excel.
+
+WHAT EVERY SETTING DOES - PER CHANNEL
+    These are written per channel, or to all 64 at once with
+    Channel = all. Only the channel your SiPM is on matters for the
+    spectrum; the rest matter because they can trigger.
+
+    Channel
+        Which of the 64 inputs the other fields on this side of the
+        page are written to. It is not the channel that gets
+        histogrammed - that one is chosen on the Measure page.
+
+    inDac  (0-255, default 128)
+        An 8-bit DAC per channel that trims the SiPM bias, and with it
+        the SiPM gain. It is the fine trim, not the coarse knob: its
+        whole span is worth roughly a couple of volts, which is about
+        28 C of thermal drift compensation. Anything larger has to come
+        from the HV supply.
+        Changing it moves the whole spectrum along the ADC axis,
+        photopeak and Compton edge together, because it changes how
+        much charge each gamma produces before the ASIC ever sees it.
+        It also moves the dark count rate, steeply.
+        Confirm the direction once on your own board: step it by 32 and
+        watch which way the peak goes. The DAC sits between the bias
+        rail and the pixel, so a larger code usually means less
+        overvoltage and a smaller pulse - but do not take that on
+        trust.
+
+    lgGain  (0-15, default 4)
+        Gain of the low-gain charge preamp, spanning about x0.5 to x8
+        across the sixteen steps. This is the pulse height knob,
+        because OUT_AMUXLG is the only signal on this board that
+        reaches an ADC.
+        Raise it and the spectrum stretches towards higher ADC
+        channels. Too far and the photopeak piles up against 4095: the
+        peak stops moving, grows a hard edge, and the overflow counter
+        on the Measure page starts climbing.
+        Lower it and the spectrum compresses towards zero. Too far and
+        the whole thing lives in the first few bins, where the
+        resolution is limited by how coarsely it is being digitised.
+        Aim to put the photopeak at roughly two thirds of full scale,
+        which leaves headroom for a higher energy line.
+
+    tauLG  (0-15, default 14 under Preset CsI)
+        Peaking time of the low-gain shaper, as an index. The step is
+        20 ns normally and 120 ns with slow shaping on, so the index
+        covers 20-300 ns fast, or 120 ns to about 1.8 us slow.
+        Raise it and the shaper integrates for longer: more of the
+        scintillation light is collected, the pulse is taller and the
+        energy resolution improves - up to the point where it is
+        collecting noise as well, or where pulses start piling up on
+        each other at high rate.
+        Lower it and less charge is collected, so the whole spectrum
+        shrinks. For CsI(Tl), whose light decays over about a
+        microsecond, a short peaking time throws most of the signal
+        away.
+        Changing this moves the shaper peak in time, so the hold delay
+        has to be re-tuned afterwards. They are not independent.
+
+    slow shaping LG  (default on under Preset CsI)
+        Switches the tauLG step from 20 ns to 120 ns. Off suits fast
+        scintillators such as LYSO or plastic. On is required for
+        CsI(Tl).
+        Turning it off while leaving tauLG at 14 drops the peaking time
+        from about 1.8 us to 300 ns, and with it most of the pulse
+        height. If the photopeak collapses for no apparent reason, this
+        is the first thing to check.
+
+    patGain  (0-63, default 32)
+        Gain of the time preamp, closed loop 15 to 100. It feeds the
+        discriminators only - it is not in the digitised path.
+        Raise it and the trigger sees a larger pulse, so the same DAC1
+        threshold now catches lower energy events and the trigger rate
+        goes up. Lower it and the effective threshold rises.
+        It does not move the photopeak. It changes which events are
+        recorded, not how tall they are once recorded.
+
+    trim T1 / trim T2  (0-63 each, default 0)
+        Per-channel threshold trims: each step takes the channel's
+        trigger point a fraction of a millivolt below the global
+        threshold, 0-15 mV over the full range.
+        Raise one and that channel triggers more readily. They exist to
+        equalise trigger points across an array; on a single-channel
+        setup leave them at 0 and use DAC1.
+
+    Enable / Disable
+        Powers a channel completely: preamps, discriminators, shapers
+        and peak detectors together.
+        Disable every channel you have not wired something to. An
+        unconnected input floats, its discriminator fires on noise, and
+        because the trigger is a NOR across all channels the whole
+        system then free-runs. This is the usual cause of a count rate
+        in the tens of thousands per second.
+
+WHAT EVERY SETTING DOES - GLOBAL
+    One copy of each of these, shared by all 64 channels.
+
+    Threshold DAC1 low  (0-1023, default 300)
+        The low time-trigger threshold, and with the default selTrig
+        the one that actually decides what is recorded.
+        Raise it and fewer events pass: noise is excluded first, then
+        the low energy end of the spectrum, which starts to show as a
+        spectrum that begins abruptly part way up the ADC axis instead
+        of rising from zero.
+        Lower it and more of the spectrum appears, until the threshold
+        reaches the noise floor and the rate explodes - thousands of
+        counts per second piled into the lowest bins.
+        Set it a little above the point where lowering it further stops
+        adding spectrum and starts adding rate.
+
+    Threshold DAC2 high  (0-1023, default 500)
+        The high time-trigger threshold. A second discriminator on the
+        same signal, used for time-over-threshold style measurements.
+        It only affects the acquisition if selTrig is set to route it.
+        Normally leave it above DAC1 and ignore it.
+
+    Threshold DACQ charge  (0-1023, default 200)
+        Threshold of the charge discriminator, which runs off the high
+        gain chain. HG is not digitised on this board, but its
+        discriminator still works, so this matters if selTrig selects
+        the charge trigger. Otherwise it does nothing.
+
+    Hold delay  (0-255) and Slope trim  (0-15)
+        Together they set how long after the trigger the peak detector
+        is sampled: delay x 0.85 ns x slope trim. Slope trim multiplies,
+        so at 0 the delay collapses to the firmware's minimum and at 15
+        it is longest.
+        This is the most important knob after gain, and the least
+        obvious. Sample too early and the shaper has not reached its
+        peak; too late and it has already decayed. Either way every
+        pulse is measured too small and the photopeak sits low, broad
+        and in the wrong place - which looks exactly like a gain
+        problem.
+        Tune it by sweeping the delay across its range and keeping the
+        value that pushes the photopeak highest. Re-tune it whenever
+        tauLG or slow shaping changes.
+        The firmware pads the nominal figure for the spread in the
+        delay cell. Type 'stat' in the console to see hold_ns: what the
+        readout will really wait for. After Preset CsI it must grow,
+        not stay put.
+
+    selTrig  (0-15, default 4)
+        Which signal starts an acquisition. The low two bits pick the
+        source: 0 = the global trigger, 1 = T1, 2 = T2, 3 = charge.
+        When they are 0, bits 3:2 pick which global trigger: 0 =
+        external TRIGEXT, 1 = T1, 2 = T2, 3 = charge.
+        The default, 4, means "global trigger fed by T1" - the DAC1
+        discriminator of any enabled channel. Change this and you
+        change which threshold has any effect at all, which is a fast
+        way to make DAC1 look broken.
+
+    external hold (HOLDEXT pin)
+        Off, the internal delay cell times the hold from the trigger,
+        which is what Hold delay above controls. On, an external pin
+        does instead. Nothing on this board drives that pin, so turning
+        it on stops acquisitions.
+
+    AMUX LG buffer
+        Powers the buffer that drives OUT_AMUXLG - the one analog pin
+        the ADC is wired to. Off, the ADC reads the same flat value for
+        every event no matter what the detector does.
+        It should always be on. It has a control here only so that
+        "every event reads the same number" has somewhere obvious to be
+        checked.
+
+WHAT EVERY SETTING DOES - MEASURE PAGE
+    Channel
+        Which channel's ADC code goes into the histogram. The raw CSV
+        keeps every channel in the readout window regardless, which is
+        what makes the dark neighbours - and with them the pedestal -
+        recoverable afterwards.
+
+    Bins  (128-2048)
+        How finely the 0-4095 ADC range is divided. 512 bins is 8 ADC
+        codes per bin.
+        More bins resolve a narrow peak better but need proportionally
+        more counts before the shape stops being noise. Fewer bins give
+        a smooth curve quickly, at the cost of knowing exactly where
+        the peak centre is. Changing this clears the histogram.
+
+    Duration  (s, 0 = manual)
+        How long Start runs for. 0 runs until Stop is pressed. The
+        counting statistics in each bin improve as the square root of
+        the time: four times as long is twice as clean.
+
+    Run label
+        Names the raw CSV and the screenshots, and shows up in History.
+        Put the temperature point and the DAC setting in it. It is what
+        tells six runs of a sweep apart afterwards.
+
+    log scale
+        Vertical axis only. Makes the Compton continuum and any small
+        peaks visible next to a tall photopeak. It changes nothing
+        about what is recorded.
+
+    log raw events
+        Writes every event, every channel, to a CSV under raw/.
+        Analysis that needs a pedestal needs this file. It costs disk,
+        not counts.
 
 WHICH SIGNAL IS MEASURED
     Only OUT_AMUXLG is wired to an ADC, so every spectrum here is the
     low gain path: one ADC code per channel per event, and the x axis is
     raw ADC counts. There is no gain choice to make and nothing to
     cross-calibrate.
-
-    lgGain is therefore the knob for pulse height. If the photopeak sits
-    in the top bin the path is saturating - lower lgGain, or lower the
-    SiPM overvoltage with inDac. If the whole spectrum is squeezed into
-    the first few bins, raise lgGain.
 
     The ASIC still has a high gain chain and the charge trigger is
     derived from it, but nothing digitises it: its output pad,
@@ -1159,6 +2389,54 @@ WHICH SIGNAL IS MEASURED
 
         ch 0 gain 4 6          lgGain 4, hgGain 6
         ch 0 gain 4            lgGain 4, HG untouched
+
+IS THE LINK ACTUALLY WORKING
+    A green Connect button means a serial port opened. It does not mean
+    the board is alive: the ST-Link enumerates whether or not the
+    firmware is running, and at the wrong baud rate every byte arrives
+    as junk.
+
+    So the firmware sends a status frame once a second, always, whether
+    or not anything is being measured. The lamp on the Main page, on
+    the Measure page and in the bottom bar watches that heartbeat:
+
+        green,  link ok
+            A heartbeat arrived within the last two seconds and nothing
+            has gone wrong in the last ten. The line beside it says how
+            long ago and how many have arrived.
+
+        amber,  link unstable
+            The link is alive but something is wrong, and the text says
+            which: a late heartbeat, frames the board had to drop, a
+            failed readout, frames that failed their CRC, or the ASIC
+            reporting that Slow Control is not answering. Counts may be
+            missing from a run taken in this state.
+            It also shows for the first few seconds after connecting,
+            saying "waiting for the first heartbeat" - not knowing yet
+            is not the same as a verdict.
+
+        red,  no data
+            Nothing has arrived for three and a half seconds. The
+            board has been unplugged, has reset, is running at a
+            different baud rate, or was never running at all.
+
+        grey,  offline
+            No port is open.
+
+    Test link, on the Main page, checks the other direction. The
+    heartbeat proves the board is transmitting; Test link asks it a
+    question and waits for the answer, which proves it is also
+    listening. A link where frames arrive but commands go nowhere looks
+    perfectly healthy until a setting silently fails to apply.
+
+    During a run the line under the plot says which kind of quiet you
+    have: LINK DOWN means the seconds passing are not being recorded at
+    all, while "link ok, no events" means the board is fine and nothing
+    is triggering - a threshold, a disabled channel, or no source.
+
+    Starting a run while the lamp is red or amber asks for confirmation
+    first, and whatever the lamp said is saved with the measurement
+    either way.
 
 TUNING THE HOLD DELAY
     The peak detector is sampled after a programmable delay. If that
@@ -1172,6 +2450,52 @@ READING THE PLOT
     Compton continuum and low intensity peaks visible next to a tall
     photopeak.
 
+WHAT IS SAVED WITH A MEASUREMENT
+    Save measurement keeps the histogram and, with it, the state of the
+    system at the moment the run started:
+
+        - The ASIC's own registers, read back from the board. When a
+          run starts, the firmware is asked for 'stat' and for a dump
+          of the channel being measured, and the reply is decoded into
+          named values: inDac, lgGain, tauLG, the thresholds, the hold
+          delay, whether the LG path is powered. This is what the chip
+          was actually set to, not what the form said.
+        - The Settings page as it stood, separately. Where the two
+          disagree, History says so under "Form and chip disagree" -
+          which is how a value that was typed but never applied shows
+          itself, months later.
+        - The acquisition setup: channel, bins, range, the duration
+          asked for, whether raw logging was on.
+        - The link's vital signs: the verdict at the start and at the
+          save, how many status frames and events arrived, the worst
+          heartbeat gap, CRC failures, and the board's own trigger,
+          readout and dropped-frame counters.
+
+    All of it is in the JSON under measurements/, in the panel beside
+    the plot in History, and in the Metadata sheet of an Excel export,
+    one row per setting.
+
+    Runs saved by an older version of this program simply show fewer
+    sections. Nothing pretends to know what it was not told.
+
+    In the simulator there are no registers to read back, so only the
+    form values are kept, and the record says why.
+
+SCREENSHOTS
+    F12, or the Screenshot button in the bottom bar, writes a PNG of the
+    whole window into the screenshots folder. It does not ask where to
+    put it - it saves and names the file in the status bar, so a run
+    never has to stop for a dialog.
+
+    Save plot PNG, on Measure and on History, keeps the spectrum on its
+    own. On Measure it also takes in the line of numbers under the plot,
+    which is what carries the counts, the rate and the temperature the
+    picture was taken at.
+
+    Run label names these files too, exactly as it names the raw CSV.
+
+    Screenshots need Pillow:  pip install pillow
+
 TEMPERATURE
     Both the SiPM gain and the crystal light yield drift with
     temperature: roughly +21 mV per degree on the SiPM breakdown
@@ -1180,16 +2504,31 @@ TEMPERATURE
     can be corrected afterwards.
 
 TROUBLESHOOTING
-    No events at all
+    The lamp is red
+        Nothing is arriving. Check the cable, check that the port is
+        the ST-Link's, and check that the firmware is running. A board
+        that has reset comes back on its own within a few seconds.
+    The lamp is amber and says frames were dropped
+        The board is producing events faster than the link can carry
+        them. Reduce the number of enabled channels or the event rate.
+        Counts recorded in this state are incomplete.
+    The lamp is green and Test link gets no reply
+        Frames are coming back but commands are not getting through.
+        Settings will appear to apply and will not.
+    No events at all, link green
         Check that the channel is enabled, that the LG AMUX buffer is
         on, and that the threshold is not far above the pulse height.
     Enormous count rate
-        The threshold is in the noise. Raise DAC1.
+        The threshold is in the noise, or unused channels are still
+        enabled. Disable them, then raise DAC1.
     Peak sitting at the very top bin
         The ADC is saturating. Lower lgGain, or lower inDac.
-    Dropped frames in the status line
-        The USB link cannot keep up. Reduce the number of enabled
-        channels or the event rate.
+    Peak low and broad for no obvious reason
+        The hold delay is not landing on the shaper peak. Check that
+        slow shaping is still on, then sweep the delay.
+    History shows "Form and chip disagree"
+        Something on the Settings page was typed and never applied.
+        The chip's value is the one the spectrum was taken with.
 
 FILES
     Measurements are kept as JSON under the measurements folder next to
@@ -1201,29 +2540,524 @@ FILES
     file is the whole readout window, including the dark channels that
     carry the baseline. Analysis that needs a pedestal needs this file.
 
+    Screenshots go to the screenshots folder as PNG, named the same way:
+    spectrum_20260824_113000_T30_dac255.png.
+
     Put the temperature point and the DAC setting in "Run label" before
     starting. It names the raw file and shows up in History, which is
     what tells six runs apart afterwards.
 """
+
+    TEXT_HE = """\
+מה זה
+    ממשק למערכת ספקטרומטריית גמא מבוססת RADIOROC2: גביש CsI(Tl)
+    שנקרא על ידי SiPM, מדוגם על ידי STM32F722 ומוזרם למחשב הזה דרך
+    ה-COM הווירטואלי של ה-ST-Link.
+
+סדר העבודה
+    1. Connect
+       בעמוד Main, בחר פורט ולחץ Connect. ודא שהנורה מתחת נדלקת
+       בירוק. אם הלוח עוד לא מוכן, לחץ Simulator כדי להכיר את
+       הממשק עם נתונים מיוצרים.
+
+    2. Settings
+       - השבת קודם את כל הערוצים (Channel = all, ואז Disable).
+         ערוצים לא מחוברים עדיין מזינים את טריגר ה-NOR ויירו על רעש.
+       - הפעל רק את הערוץ שאליו ה-SiPM מחובר.
+       - לחץ Preset CsI. זה חשוב: ברירת המחדל של ה-ASIC היא צעדי
+         shaping של 20 ns, בעוד שאור CsI(Tl) דועך לאורך כמיקרושנייה.
+         בלי slow shaping המטען לעולם לא נאסף במלואו, ורזולוציית
+         האנרגיה קורסת.
+       - קבע את הספים. נמוך מדי והמערכת רצה חופשי על רעש; גבוה מדי
+         ואתה מאבד את הקצה הנמוך של הספקטרום.
+       - לחץ Apply. שום דבר בעמוד הזה לא מגיע לשבב לפני כן, והרשומה
+         השמורה תגיד את זה אם תשכח.
+
+    3. Measure
+       בחר ערוץ, קבע מספר תאים ומשך, ולחץ Start. הספקטרום נבנה
+       בזמן אמת. לחץ Save measurement כשהוא נראה סביר.
+
+    4. History
+       בחר ריצה כדי לראות אותה ואת ההגדרות שבהן נמדדה, ואז
+       Export to Excel.
+
+מה כל ערך עושה - לפי ערוץ
+    אלה נכתבים לערוץ בודד, או לכל 64 בבת אחת עם Channel = all. רק
+    הערוץ שה-SiPM יושב עליו משנה לספקטרום; השאר משנים כי הם יכולים
+    לירות טריגר.
+
+    Channel
+        לאיזה מ-64 הכניסות נכתבות שאר השדות בצד הזה של העמוד. זה
+        אינו הערוץ שנכנס להיסטוגרמה - אותו בוחרים בעמוד Measure.
+
+    inDac  (0-255, ברירת מחדל 128)
+        DAC של 8 ביט לכל ערוץ, שמכוונן את מתח ה-SiPM ואיתו את ההגבר
+        שלו. זהו הכוונון העדין, לא הכפתור הגס: כל הטווח שלו שווה
+        בערך לזוג וולטים, שהם כ-28 מעלות של פיצוי דריפט תרמי. כל מה
+        שגדול מזה חייב להגיע מספק ה-HV.
+        שינוי שלו מזיז את כל הספקטרום לאורך ציר ה-ADC, פוטו-פיק
+        וקצה Compton יחד, כי הוא משנה כמה מטען כל גמא מייצר עוד לפני
+        שה-ASIC רואה אותו. הוא גם מזיז את קצב ה-dark count, בתלילות.
+        ודא את הכיוון פעם אחת על הלוח שלך: הזז אותו ב-32 וראה לאן זז
+        הפיק. ה-DAC יושב בין מסילת המתח לפיקסל, ולכן קוד גדול יותר
+        פירושו בדרך כלל פחות מתח יתר ופולס קטן יותר - אבל אל תסמוך
+        על זה בלי לבדוק.
+
+    lgGain  (0-15, ברירת מחדל 4)
+        ההגבר של מגבר המטען בערוץ ה-low gain, בטווח של בערך x0.5 עד
+        x8 לאורך שישה עשר הצעדים. זהו הכפתור לגובה הפולס, כי
+        OUT_AMUXLG הוא האות היחיד בלוח הזה שמגיע ל-ADC.
+        העלאה שלו מותחת את הספקטרום כלפי ערוצי ADC גבוהים יותר. יותר
+        מדי, והפוטו-פיק נערם על 4095: הפיק מפסיק לזוז, מקבל קצה חד,
+        ומונה ה-overflow בעמוד Measure מתחיל לטפס.
+        הורדה שלו דוחסת את הספקטרום לכיוון האפס. יותר מדי, וכל
+        הספקטרום חי בתאים הראשונים, שם הרזולוציה מוגבלת על ידי
+        גסות הדיגיטציה.
+        כוון לפוטו-פיק בערך בשני שלישים מהסקאלה המלאה, מה שמשאיר
+        מקום לקו אנרגיה גבוה יותר.
+
+    tauLG  (0-15, ברירת מחדל 14 תחת Preset CsI)
+        זמן העלייה של ה-shaper בערוץ ה-low gain, כאינדקס. הצעד הוא
+        20 ns רגיל ו-120 ns כאשר slow shaping דלוק, כך שהאינדקס מכסה
+        20-300 ns מהיר, או 120 ns עד כ-1.8 us איטי.
+        העלאה שלו מאריכה את האינטגרציה: יותר מאור הסינטילציה נאסף,
+        הפולס גבוה יותר ורזולוציית האנרגיה משתפרת - עד לנקודה שבה
+        נאסף גם רעש, או שפולסים מתחילים להיערם זה על זה בקצב גבוה.
+        הורדה שלו אוספת פחות מטען, וכל הספקטרום מתכווץ. עבור
+        CsI(Tl), שאורו דועך לאורך כמיקרושנייה, זמן עלייה קצר זורק את
+        רוב האות.
+        שינוי הערך הזה מזיז את שיא ה-shaper בזמן, ולכן יש לכוון מחדש
+        את hold delay אחריו. הם אינם בלתי תלויים.
+
+    slow shaping LG  (דלוק תחת Preset CsI)
+        מחליף את צעד ה-tauLG מ-20 ns ל-120 ns. כבוי מתאים
+        לסינטילטורים מהירים כמו LYSO או פלסטיק. דלוק נדרש ל-CsI(Tl).
+        כיבוי שלו בזמן ש-tauLG נשאר על 14 מפיל את זמן העלייה מכ-1.8
+        us ל-300 ns, ואיתו את רוב גובה הפולס. אם הפוטו-פיק קורס בלי
+        סיבה נראית לעין, זה הדבר הראשון לבדוק.
+
+    patGain  (0-63, ברירת מחדל 32)
+        ההגבר של מגבר הזמן, לולאה סגורה 15 עד 100. הוא מזין רק את
+        הדיסקרימינטורים - הוא אינו במסלול המדוגם.
+        העלאה שלו גורמת לטריגר לראות פולס גדול יותר, כך שאותו סף
+        DAC1 תופס עכשיו אירועים באנרגיה נמוכה יותר וקצב הטריגר עולה.
+        הורדה שלו מעלה את הסף האפקטיבי.
+        הוא אינו מזיז את הפוטו-פיק. הוא משנה אילו אירועים נרשמים, לא
+        כמה גבוהים הם אחרי שנרשמו.
+
+    trim T1 / trim T2  (0-63 כל אחד, ברירת מחדל 0)
+        כוונון סף לכל ערוץ: כל צעד מוריד את נקודת הטריגר של הערוץ
+        בשבריר מיליוולט מתחת לסף הגלובלי, 0-15 mV לאורך כל הטווח.
+        העלאה של אחד מהם גורמת לערוץ לירות ביתר קלות. הם קיימים כדי
+        להשוות נקודות טריגר בין ערוצי מערך; במערכת חד-ערוצית השאר
+        אותם על 0 והשתמש ב-DAC1.
+
+    Enable / Disable
+        מפעיל או מכבה ערוץ שלם: מגברים, דיסקרימינטורים, shapers
+        ו-peak detectors יחד.
+        השבת כל ערוץ שלא חיברת אליו דבר. כניסה לא מחוברת צפה,
+        הדיסקרימינטור שלה יורה על רעש, ומכיוון שהטריגר הוא NOR על פני
+        כל הערוצים המערכת כולה רצה חופשי. זו הסיבה הרגילה לקצב ספירה
+        של עשרות אלפים בשנייה.
+
+מה כל ערך עושה - גלובלי
+    עותק אחד מכל אחד מאלה, משותף לכל 64 הערוצים.
+
+    Threshold DAC1 low  (0-1023, ברירת מחדל 300)
+        סף הטריגר הזמני הנמוך, ועם selTrig שבברירת המחדל הוא זה
+        שבאמת מחליט מה נרשם.
+        העלאה שלו מעבירה פחות אירועים: קודם נחסם הרעש, ואז הקצה
+        הנמוך של הספקטרום, שמתחיל להיראות כספקטרום שמתחיל בחדות
+        באמצע ציר ה-ADC במקום לעלות מאפס.
+        הורדה שלו חושפת יותר מהספקטרום, עד שהסף מגיע לרצפת הרעש
+        והקצב מתפוצץ - אלפי ספירות בשנייה נערמות בתאים הנמוכים.
+        קבע אותו מעט מעל הנקודה שבה הורדה נוספת מפסיקה להוסיף
+        ספקטרום ומתחילה להוסיף קצב.
+
+    Threshold DAC2 high  (0-1023, ברירת מחדל 500)
+        סף הטריגר הזמני הגבוה. דיסקרימינטור שני על אותו אות, לשימוש
+        במדידות מסוג time-over-threshold. הוא משפיע על הרכישה רק אם
+        selTrig מנתב אותו. בדרך כלל השאר אותו מעל DAC1 והתעלם.
+
+    Threshold DACQ charge  (0-1023, ברירת מחדל 200)
+        הסף של דיסקרימינטור המטען, שרץ ממסלול ה-high gain. ה-HG אינו
+        מדוגם בלוח הזה, אבל הדיסקרימינטור שלו עדיין עובד, ולכן זה
+        משנה אם selTrig בוחר בטריגר המטען. אחרת הוא לא עושה דבר.
+
+    Hold delay  (0-255)  ו-Slope trim  (0-15)
+        יחד הם קובעים כמה זמן אחרי הטריגר נדגם ה-peak detector:
+        delay x 0.85 ns x slope trim. ה-slope trim מכפיל, כך שב-0
+        ההשהיה מתכווצת למינימום של הקושחה ועל 15 היא הארוכה ביותר.
+        זהו הכפתור החשוב ביותר אחרי ההגבר, והפחות מובן מאליו. דגימה
+        מוקדמת מדי וה-shaper עוד לא הגיע לשיאו; מאוחרת מדי והוא כבר
+        דעך. כך או כך כל פולס נמדד כקטן מדי, והפוטו-פיק יושב נמוך,
+        רחב ובמקום הלא נכון - מה שנראה בדיוק כמו בעיית הגבר.
+        כוון אותו על ידי סריקת ההשהיה לאורך הטווח, ושמור את הערך
+        שדוחף את הפוטו-פיק הכי גבוה. כוון מחדש בכל פעם ש-tauLG או
+        slow shaping משתנים.
+        הקושחה מוסיפה מרווח על הערך הנומינלי בגלל הפיזור בתא ההשהיה.
+        הקלד stat בקונסולה כדי לראות את hold_ns: כמה הקריאה באמת
+        תמתין. אחרי Preset CsI הוא חייב לגדול, לא להישאר במקומו.
+
+    selTrig  (0-15, ברירת מחדל 4)
+        איזה אות מתחיל רכישה. שני הביטים הנמוכים בוחרים את המקור:
+        0 = הטריגר הגלובלי, 1 = T1, 2 = T2, 3 = מטען. כשהם 0, ביטים
+        3:2 בוחרים איזה טריגר גלובלי: 0 = TRIGEXT חיצוני, 1 = T1,
+        2 = T2, 3 = מטען.
+        ברירת המחדל, 4, פירושה "טריגר גלובלי מוזן מ-T1" - כלומר
+        דיסקרימינטור ה-DAC1 של כל ערוץ פעיל. שינוי שלו משנה איזה סף
+        בכלל משפיע, וזו דרך מהירה לגרום ל-DAC1 להיראות שבור.
+
+    external hold (HOLDEXT pin)
+        כבוי, תא ההשהיה הפנימי מתזמן את ה-hold מרגע הטריגר - זה מה
+        ש-Hold delay למעלה שולט בו. דלוק, פין חיצוני עושה זאת במקומו.
+        שום דבר בלוח הזה לא מניע את הפין ההוא, ולכן הדלקה שלו עוצרת
+        את הרכישות.
+
+    AMUX LG buffer
+        מפעיל את המאגר שמניע את OUT_AMUXLG - הפין האנלוגי היחיד
+        שה-ADC מחובר אליו. כבוי, ה-ADC קורא את אותו ערך שטוח לכל
+        אירוע, לא משנה מה הגלאי עושה.
+        הוא צריך להיות דלוק תמיד. יש לו פקד כאן רק כדי של"כל אירוע
+        קורא את אותו מספר" יהיה מקום ברור להיבדק בו.
+
+מה כל ערך עושה - עמוד Measure
+    Channel
+        איזה ערוץ נכנס להיסטוגרמה. קובץ ה-raw שומר בכל מקרה את כל
+        הערוצים בחלון הקריאה, וזה מה שהופך את השכנים החשוכים - ואיתם
+        את הפדסטל - לניתנים לשחזור בדיעבד.
+
+    Bins  (128-2048)
+        לכמה תאים מחולק טווח ה-ADC 0-4095. 512 תאים הם 8 קודי ADC
+        לתא.
+        יותר תאים מפרידים פיק צר טוב יותר, אבל דורשים פי כמה יותר
+        ספירות עד שהצורה מפסיקה להיות רעש. פחות תאים נותנים עקומה
+        חלקה מהר, במחיר של דיוק במיקום מרכז הפיק. שינוי הערך מנקה את
+        ההיסטוגרמה.
+
+    Duration  (שניות, 0 = ידני)
+        כמה זמן Start רץ. 0 רץ עד שלוחצים Stop. הסטטיסטיקה בכל תא
+        משתפרת כשורש הזמן: פי ארבעה זמן הוא פי שניים ניקיון.
+
+    Run label
+        נותן שם לקובץ ה-raw ולצילומי המסך, ומופיע ב-History. כתוב בו
+        את נקודת הטמפרטורה ואת ערך ה-DAC. זה מה שיבדיל בין שש ריצות
+        של סריקה אחר כך.
+
+    log scale
+        ציר אנכי בלבד. מאפשר לראות את רצף Compton ופיקים קטנים לצד
+        פוטו-פיק גבוה. הוא אינו משנה דבר במה שנרשם.
+
+    log raw events
+        כותב כל אירוע, כל ערוץ, ל-CSV תחת raw/. כל ניתוח שצריך
+        פדסטל צריך את הקובץ הזה. הוא עולה בדיסק, לא בספירות.
+
+איזה אות נמדד
+    רק OUT_AMUXLG מחובר ל-ADC, ולכן כל ספקטרום כאן הוא מסלול ה-low
+    gain: קוד ADC אחד לכל ערוץ לכל אירוע, וציר ה-X הוא ספירות ADC
+    גולמיות. אין מה לבחור בין מסלולי הגבר ואין מה לכייל ביניהם.
+
+    ל-ASIC עדיין יש מסלול high gain וטריגר המטען נגזר ממנו, אבל אף
+    אחד לא מדגם אותו: פד היציאה שלו, OUT_AMUXHG, אינו מחובר והמאגר
+    שלו נכתב כבוי. לכן אין לו פקדים בעמוד Settings, ו-Apply channel
+    משאיר את הרגיסטרים שלו בדיוק כפי שהיו. אם בכל זאת תצטרך אותו,
+    הקונסולה עדיין מקבלת ארגומנט שני:
+
+        ch 0 gain 4 6          lgGain 4, hgGain 6
+        ch 0 gain 4            lgGain 4, ה-HG לא נגע
+
+האם התקשורת באמת עובדת
+    כפתור Connect ירוק אומר שפורט טורי נפתח. הוא אינו אומר שהלוח חי:
+    ה-ST-Link נרשם בין אם הקושחה רצה ובין אם לא, ובקצב שידור שגוי כל
+    בית מגיע כזבל.
+
+    לכן הקושחה שולחת מסגרת סטטוס פעם בשנייה, תמיד, בין אם נמדד משהו
+    ובין אם לא. הנורה בעמוד Main, בעמוד Measure ובשורה התחתונה עוקבת
+    אחרי הדופק הזה:
+
+        ירוק,  link ok
+            דופק הגיע בשתי השניות האחרונות ושום דבר לא נכשל בעשר
+            האחרונות. השורה לידו אומרת לפני כמה זמן וכמה הגיעו.
+
+        כתום,  link unstable
+            הקישור חי אבל משהו לא בסדר, והטקסט אומר מה: דופק מאוחר,
+            מסגרות שהלוח נאלץ לזרוק, קריאה שנכשלה, מסגרות שנכשלו
+            ב-CRC, או ASIC שמדווח שה-Slow Control אינו עונה. ייתכן
+            שחסרות ספירות בריצה שנלקחה במצב הזה.
+            הוא מופיע גם בשניות הראשונות אחרי חיבור, ואומר
+            "waiting for the first heartbeat" - עוד לא לדעת זה לא
+            אותו דבר כמו פסק דין.
+
+        אדום,  no data
+            שלוש וחצי שניות בלי כלום. הלוח נותק, אותחל, רץ בקצב
+            שידור אחר, או שמעולם לא רץ. אם בתים כן מגיעים אבל שום
+            דבר לא מפוענח, הטקסט אומר לבדוק את קצב השידור.
+
+        אפור,  offline
+            אין פורט פתוח.
+
+    Test link, בעמוד Main, בודק את הכיוון ההפוך. הדופק מוכיח שהלוח
+    משדר; Test link שואל אותו שאלה ומחכה לתשובה, מה שמוכיח שהוא גם
+    מקשיב. קישור שבו מסגרות מגיעות אבל פקודות הולכות לאיבוד נראה
+    בריא לגמרי - עד שהגדרה נכשלת בשקט.
+
+    בזמן ריצה השורה מתחת לגרף אומרת איזה סוג של שקט זה: LINK DOWN
+    פירושו שהשניות שעוברות אינן נרשמות בכלל, ואילו
+    "link ok, no events" פירושו שהלוח בסדר ושום דבר לא מפעיל טריגר -
+    סף, ערוץ מושבת, או שאין מקור.
+
+    התחלת ריצה כשהנורה אדומה או כתומה מבקשת אישור, ומה שהנורה אמרה
+    נשמר עם המדידה בכל מקרה.
+
+כיוונון השהיית ה-hold
+    ה-peak detector נדגם אחרי השהיה ניתנת לתכנות. אם ההשהיה אינה
+    נוחתת על שיא ה-shaper, כל פולס נמדד כקטן מדי. סרוק את Hold delay
+    לאורך הטווח שלו תוך מעקב אחרי מיקום הפוטו-פיק, ושמור את הערך
+    שדוחף אותו הכי גבוה.
+
+קריאת הגרף
+    הקו האדום המקווקו מסמן את התא הגבוה ביותר. רחף עם העכבר בכל מקום
+    כדי לקרוא את ערך ה-ADC ואת מספר הספירות באותו תא. log scale
+    מאפשר לראות את רצף Compton ופיקים חלשים לצד פוטו-פיק גבוה.
+
+מה נשמר עם מדידה
+    Save measurement שומר את ההיסטוגרמה, ואיתה את מצב המערכת ברגע
+    שהריצה התחילה:
+
+        - הרגיסטרים של ה-ASIC עצמו, כפי שנקראו מהלוח. כשריצה
+          מתחילה, הקושחה נשאלת stat ו-dump של הערוץ הנמדד, והתשובה
+          מפוענחת לערכים בעלי שם: inDac, lgGain, tauLG, הספים,
+          השהיית ה-hold, והאם מסלול ה-LG מוזן. זה מה שהשבב היה מכוון
+          אליו בפועל, לא מה שהטופס אמר.
+        - עמוד Settings כפי שהיה, בנפרד. איפה שהשניים אינם מסכימים,
+          History אומר זאת תחת "Form and chip disagree" - כך ערך
+          שהוקלד ומעולם לא הוחל מסגיר את עצמו, חודשים אחרי.
+        - הגדרות הרכישה: ערוץ, תאים, טווח, המשך שהתבקש, והאם רישום
+          raw היה פעיל.
+        - סימני החיים של הקישור: הפסק בהתחלה ובשמירה, כמה מסגרות
+          סטטוס ואירועים הגיעו, פער הדופק הגרוע ביותר, כשלי CRC,
+          והמונים של הלוח עצמו לטריגרים, קריאות ומסגרות שנזרקו.
+
+    הכול נמצא ב-JSON תחת measurements/, בחלונית שליד הגרף ב-History,
+    ובגיליון Metadata של ייצוא Excel - שורה לכל הגדרה.
+
+    ריצות שנשמרו בגרסה קודמת של התוכנה פשוט מציגות פחות מקטעים. שום
+    דבר לא מתיימר לדעת מה שלא נאמר לו.
+
+    במצב סימולציה אין רגיסטרים לקרוא, ולכן נשמרים רק ערכי הטופס,
+    והרשומה אומרת למה.
+
+צילומי מסך
+    F12, או כפתור Screenshot בשורה התחתונה, כותב PNG של כל החלון
+    לתיקיית screenshots. הוא אינו שואל לאן לשמור - הוא שומר ואומר את
+    שם הקובץ בשורת הסטטוס, כך שריצה לעולם לא נעצרת בשביל דיאלוג.
+
+    Save plot PNG, ב-Measure וב-History, שומר את הספקטרום לבדו.
+    ב-Measure הוא לוקח גם את שורת המספרים שמתחת לגרף, שהיא זו שנושאת
+    את הספירות, הקצב והטמפרטורה שבהם התמונה נלקחה.
+
+    Run label נותן שם גם לקבצים האלה, בדיוק כפי שהוא נותן שם ל-CSV
+    הגולמי.
+
+    צילומי מסך דורשים את Pillow:  pip install pillow
+
+טמפרטורה
+    גם ההגבר של ה-SiPM וגם תפוקת האור של הגביש נודדים עם הטמפרטורה:
+    בערך 21 mV למעלה על מתח הפריצה של ה-SiPM, וכ-0.3 אחוז למעלה
+    בתפוקת האור. הטמפרטורה נרשמת עם כל מדידה כדי שאפשר יהיה לתקן את
+    מיקום הפיק בדיעבד.
+
+פתרון בעיות
+    הנורה אדומה
+        שום דבר לא מגיע. בדוק את הכבל, בדוק שהפורט הוא זה של
+        ה-ST-Link, ובדוק שהקושחה רצה. לוח שאותחל חוזר מעצמו תוך
+        כמה שניות.
+    הנורה כתומה ואומרת שמסגרות נזרקו
+        הלוח מייצר אירועים מהר יותר מכפי שהקישור מסוגל לשאת. צמצם את
+        מספר הערוצים הפעילים או את קצב האירועים. ספירות שנרשמו במצב
+        הזה אינן שלמות.
+    הנורה ירוקה ו-Test link לא מקבל תשובה
+        מסגרות חוזרות אבל פקודות אינן עוברות. הגדרות ייראו כאילו
+        הוחלו, ולא יוחלו.
+    אין אירועים בכלל, נורה ירוקה
+        בדוק שהערוץ מופעל, שמאגר ה-AMUX של LG דלוק, ושהסף אינו הרבה
+        מעל גובה הפולס.
+    קצב ספירה עצום
+        הסף בתוך הרעש, או שערוצים לא בשימוש עדיין מופעלים. השבת אותם
+        ואז העלה את DAC1.
+    הפיק יושב בתא העליון ביותר
+        ה-ADC רווי. הורד את lgGain, או הורד את inDac.
+    הפיק נמוך ורחב בלי סיבה נראית לעין
+        השהיית ה-hold אינה נוחתת על שיא ה-shaper. בדוק ש-slow
+        shaping עדיין דלוק, ואז סרוק את ההשהיה.
+    History מציג "Form and chip disagree"
+        משהו בעמוד Settings הוקלד ומעולם לא הוחל. הערך של השבב הוא
+        זה שהספקטרום נמדד איתו.
+
+קבצים
+    מדידות נשמרות כ-JSON בתיקיית measurements ליד הסקריפט הזה -
+    ההיסטוגרמה, ועוד מה שהיא נמדדה תחתיו.
+
+    כאשר log raw events מסומן, כל אירוע נכתב גם ל-CSV תחת תיקיית
+    raw: שורה לכל ערוץ, עם הטמפרטורה שהלוח דיווח עבור אותו אירוע.
+    ההיסטוגרמה היא ערוץ אחד; קובץ ה-raw הוא כל חלון הקריאה, כולל
+    הערוצים החשוכים שנושאים את קו הבסיס. כל ניתוח שצריך פדסטל צריך
+    את הקובץ הזה.
+
+    צילומי מסך הולכים לתיקיית screenshots כ-PNG, עם אותה שיטת שמות:
+    spectrum_20260824_113000_T30_dac255.png.
+
+    כתוב את נקודת הטמפרטורה ואת ערך ה-DAC ב-Run label לפני שאתה
+    מתחיל. זה נותן שם לקובץ הגולמי ומופיע ב-History, וזה מה שיבדיל
+    בין שש ריצות אחר כך.
+"""
+
+    # Right-to-left embedding, and the pop that ends it. Tk gives every
+    # line a left-to-right base direction, which puts the full stop of a
+    # Hebrew sentence on the wrong side; these ask the platform for an
+    # RTL base instead. They go on one line at a time, which is why the
+    # Hebrew text is hard-wrapped and its widget never re-wraps: a line
+    # broken by the widget loses the embedding on its continuation and
+    # comes out scrambled.
+    RLE, PDF = "\u202B", "\u202C"
+
+    LANGS = ("en", "he")
+
+    def _lang(self):
+        """Everything that differs between the two renderings."""
+        if self.v_lang.get() == "he":
+            return {
+                "text": self.TEXT_HE,
+                "title": "\u05d4\u05d5\u05e8\u05d0\u05d5\u05ea",
+                "font": ("Segoe UI", 11),
+                "justify": "right",
+                "wrap": "none",          # see the note on RLE above
+                "nav_side": "right",     # the index mirrors with the text
+                "rtl": True,
+            }
+        return {
+            "text": self.TEXT,
+            "title": "Instructions",
+            "font": ("Consolas", 10),
+            "justify": "left",
+            "wrap": "word",
+            "nav_side": "left",
+            "rtl": False,
+        }
 
     def build(self):
         top = ttk.Frame(self)
         top.pack(fill="x")
         ttk.Button(top, text="< Main", command=lambda: self.app.show("main"))\
             .pack(side="left")
-        ttk.Label(top, text="Instructions", style="H1.TLabel")\
-            .pack(side="left", padx=12)
+        self.lbl_title = ttk.Label(top, text="Instructions", style="H1.TLabel")
+        self.lbl_title.pack(side="left", padx=12)
 
-        wrap = ttk.Frame(self)
-        wrap.pack(fill="both", expand=True, pady=12)
-        txt = tk.Text(wrap, wrap="word", relief="flat", bg=C_PANEL,
-                      fg=C_TEXT, font=("Consolas", 10), padx=14, pady=12)
-        txt.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(wrap, command=txt.yview)
-        sb.pack(side="right", fill="y")
+        self.v_lang = tk.StringVar(
+            value=self.app.prefs.get("help_lang", "en"))
+        if self.v_lang.get() not in self.LANGS:
+            self.v_lang.set("en")
+        pick = ttk.Frame(top)
+        pick.pack(side="right")
+        ttk.Label(pick, text="language", style="Sub.TLabel").pack(side="left")
+        for code, name in (("en", "English"),
+                           ("he", "\u05e2\u05d1\u05e8\u05d9\u05ea")):
+            ttk.Radiobutton(pick, text=name, value=code,
+                            variable=self.v_lang, command=self.relayout)\
+                .pack(side="left", padx=(10, 0))
+
+        self.wrap = ttk.Frame(self)
+        self.wrap.pack(fill="both", expand=True, pady=12)
+        self.relayout()
+
+    def relayout(self):
+        """Draw the page in the language that is now selected.
+
+        The widgets are rebuilt rather than reconfigured: font, wrapping,
+        justification and which side the index sits on all change
+        together, and there is nothing to gain by doing that in place.
+        """
+        lang = self._lang()
+        self.app.set_pref("help_lang", self.v_lang.get())
+        for child in self.wrap.winfo_children():
+            child.destroy()
+        self.lbl_title.configure(text=lang["title"])
+
+        # Headings are the lines that start at column 0. Ten screens of
+        # text cannot be scrolled through, so they get an index.
+        lines = lang["text"].split("\n")
+        self.marks = [(i + 1, ln) for i, ln in enumerate(lines)
+                      if ln and not ln.startswith(" ")]
+
+        nav = tk.Listbox(self.wrap, width=40, relief="flat", bg=C_PANEL,
+                         fg=C_TEXT, highlightthickness=1,
+                         highlightbackground=C_GRID, activestyle="none",
+                         justify="right" if lang["rtl"] else "left",
+                         font=("Segoe UI", 9))
+        for _, ln in self.marks:
+            nav.insert("end", self._shape(ln if lang["rtl"]
+                                          else ln.capitalize(), lang))
+        nav.pack(side=lang["nav_side"], fill="y",
+                 padx=(12, 0) if lang["rtl"] else (0, 12))
+        nav.bind("<<ListboxSelect>>", self._jump)
+        self.nav = nav
+
+        body = ttk.Frame(self.wrap)
+        body.pack(side=lang["nav_side"], fill="both", expand=True)
+        txt = tk.Text(body, wrap=lang["wrap"], relief="flat", bg=C_PANEL,
+                      fg=C_TEXT, font=lang["font"], padx=14, pady=12)
+        sb = ttk.Scrollbar(body, command=txt.yview)
+        sb.pack(side="left" if lang["rtl"] else "right", fill="y")
+        txt.pack(side="right" if lang["rtl"] else "left",
+                 fill="both", expand=True)
         txt.configure(yscrollcommand=sb.set)
-        txt.insert("1.0", self.TEXT)
+
+        txt.tag_configure("body", justify=lang["justify"])
+        txt.tag_configure("head", font=(lang["font"][0], lang["font"][1],
+                                        "bold"),
+                          foreground=C_ACCENT_DK, spacing1=10,
+                          justify=lang["justify"])
+        # Right to left, the indent cannot be leading spaces: reordered,
+        # they end up on the far side of the line and move its right edge
+        # by nothing at all. Measured, four spaces and eight leave a line
+        # in exactly the same place as none. The widget's own right
+        # margin does move it, so the structure is expressed that way and
+        # _shape() drops the spaces before the text is ever laid out.
+        # One digit's width per space, to match the weight of the
+        # indent on the English page, which is set in a monospace font.
+        space = tkfont.Font(font=lang["font"]).measure("0")
+        heads = {n for n, _ in self.marks}
+        for i, line in enumerate(lines, start=1):
+            tags = ["head" if i in heads else "body"]
+            if lang["rtl"]:
+                pad = len(line) - len(line.lstrip(" "))
+                if pad:
+                    tag = "ind%d" % pad
+                    txt.tag_configure(tag, rmargin=pad * space)
+                    tags.append(tag)
+            txt.insert("end", self._shape(line, lang) + "\n", tuple(tags))
         txt.configure(state="disabled")
+        self.txt = txt
+
+    def _shape(self, line, lang):
+        """One line, ready to hand to Tk in this language.
+
+        The leading spaces come off for Hebrew - relayout() turns them
+        into a right margin instead - so the bidi engine only ever sees
+        words, and never has to decide which side a run of neutral
+        spaces belongs on.
+        """
+        if not lang["rtl"] or not line.strip():
+            return line
+        return self.RLE + line.strip() + self.PDF
+
+    def _jump(self, _ev=None):
+        sel = self.nav.curselection()
+        if sel:
+            # see() puts the line on screen; yview puts it at the top,
+            # which is what a table of contents is expected to do.
+            self.txt.see("%d.0" % self.marks[sel[0]][0])
+            self.txt.yview("%d.0" % self.marks[sel[0]][0])
 
 
 # ===================================================================
@@ -1238,7 +3072,32 @@ class App(tk.Tk):
         self.configure(bg=C_BG)
 
         self.link = Link()
+        self.prefs = load_prefs()
+        # Two things the pages all need to agree about: what the board
+        # says it is set to, and whether it is still talking.
+        self.state = DeviceState()
+        self.health = LinkHealth()
+        self._health_at = 0.0
         self._style()
+
+        # The bottom bar is packed first, before the pages. History asks
+        # for 745 px of height in a 740 px window, and the packer gives
+        # whatever comes after it the cavity that is left - which was
+        # nothing, so the status line never appeared at all.
+        self._status_text = "offline"
+        self._toast_job = None
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", side="bottom")
+        self.status = ttk.Label(bottom, text=self._status_text,
+                                style="Sub.TLabel", anchor="w",
+                                padding=(14, 6))
+        self.status.pack(side="left", fill="x", expand=True)
+        ttk.Button(bottom, text="Screenshot (F12)",
+                   command=self.screenshot).pack(side="right", padx=(6, 10))
+        # Visible from every page, because the link can die on any of
+        # them and the one that matters is whichever is on screen.
+        self.health_bar = HealthLight(bottom, detail=False)
+        self.health_bar.pack(side="right", padx=(6, 10))
 
         container = ttk.Frame(self)
         container.pack(fill="both", expand=True)
@@ -1253,11 +3112,8 @@ class App(tk.Tk):
             pg.grid(row=0, column=0, sticky="nsew")
             self.pages[key] = pg
 
-        self.status = ttk.Label(self, text="offline", style="Sub.TLabel",
-                                anchor="w", padding=(14, 6))
-        self.status.pack(fill="x", side="bottom")
-
         self.show("main")
+        self.bind("<F12>", lambda _e: self.screenshot())
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         if sim:
@@ -1284,12 +3140,21 @@ class App(tk.Tk):
         st.configure("H2.TLabel", font=("Segoe UI Semibold", 13))
         st.configure("Sub.TLabel", foreground=C_MUTED)
         st.configure("Ok.TLabel", foreground=C_OK)
+        st.configure("Warn.TLabel", foreground=C_WARN)
         st.configure("Bad.TLabel", foreground=C_BAD)
+        st.configure("Mono.TLabel", font=("Consolas", 9))
         st.configure("TButton", padding=(12, 6))
         st.configure("Accent.TButton", background=C_ACCENT, foreground="white")
         st.map("Accent.TButton", background=[("active", C_ACCENT_DK)])
         st.configure("Treeview", background=C_PANEL, fieldbackground=C_PANEL,
                      rowheight=24)
+
+    # -- preferences
+    def set_pref(self, key, value):
+        """Remember one choice across runs."""
+        if self.prefs.get(key) != value:
+            self.prefs[key] = value
+            save_prefs(self.prefs)
 
     # -- navigation
     def show(self, key):
@@ -1297,11 +3162,52 @@ class App(tk.Tk):
         pg.tkraise()
         pg.on_show()
 
+    # -- screenshots
+    def screenshot(self, target=None, label="", kind="shot"):
+        """PNG of the window, or of `target`, straight into screenshots/.
+
+        No file dialog: during a sweep the point is one keypress and back
+        to the run. The status bar says where it went.
+        """
+        if target is None:
+            widgets = [self]
+        elif isinstance(target, (list, tuple)):
+            widgets = list(target)
+        else:
+            widgets = [target]
+        try:
+            path = grab_widgets(widgets, shot_path(kind, label),
+                                pad=0 if target is None else 6)
+        except Exception as exc:
+            messagebox.showerror("Screenshot failed", str(exc))
+            return None
+        self.toast("saved  screenshots/" + os.path.basename(path))
+        return path
+
+    # -- status bar
+    def toast(self, msg, ms=5000):
+        """Say something in the status bar, then hand it back to the link."""
+        if self._toast_job:
+            self.after_cancel(self._toast_job)
+        self.status.configure(text=msg)
+        self._toast_job = self.after(ms, self._clear_toast)
+
+    def _clear_toast(self):
+        if self._toast_job:
+            self.after_cancel(self._toast_job)
+            self._toast_job = None
+        self.status.configure(text=self._status_text)
+
     # -- connection state
     def set_state(self, connected, where):
-        self.status.configure(
-            text=f"connected to {where}" if connected else "offline")
+        self._status_text = f"connected to {where}" if connected else "offline"
+        self._clear_toast()          # the link state outranks a toast
+        # A fresh connection starts with a clean sheet: the CRC errors
+        # and missed heartbeats of the last one say nothing about it.
+        self.health.reset()
+        self.health.on_stats(self.link.stats())
         self.refresh_state_labels()
+        self.refresh_health()
 
     def refresh_state_labels(self):
         main = self.pages["main"]
@@ -1319,16 +3225,35 @@ class App(tk.Tk):
             except queue.Empty:
                 break
             drained += 1
+            self.health.on_frame(frame)
             self.pages["measure"].feed(frame)
 
         while True:
             try:
-                self.pages["settings"].log(self.link.text.get_nowait())
+                line = self.link.text.get_nowait()
             except queue.Empty:
                 break
+            # Parse first, then print. The console is for reading; the
+            # parsed copy is what gets saved with the measurement.
+            self.state.feed(line)
+            self.pages["settings"].log(line)
+
+        now = time.monotonic()
+        if now - self._health_at > 0.5:
+            self._health_at = now
+            self.health.on_stats(self.link.stats())
+            self.refresh_health()
 
         self.pages["measure"].tick()
         self.after(40, self.pump)
+
+    # -- link health
+    def refresh_health(self):
+        """Push one verdict to every indicator on screen."""
+        level, why = self.health.summary(self.link.connected)
+        self.health_bar.update_health(level, why)
+        self.pages["main"].light.update_health(level, why)
+        self.pages["measure"].light.update_health(level, why)
 
     def on_close(self):
         self.link.close()
