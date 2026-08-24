@@ -23,6 +23,11 @@ venv/
 *.bin
 /python/screenshots/
 
+# Saved measurements. Bench data, not source: a thermal sweep is a few
+# hundred of these, they belong wherever the analysis lives, and a
+# repository of firmware is not it.
+/python/measurements/
+
 # The handful of choices the GUI remembers between runs.
 /python/gui_prefs.json
 
