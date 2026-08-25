@@ -1099,7 +1099,7 @@ TROUBLESHOOTING
     Enormous count rate
         The threshold is in the noise. Raise DAC1.
     Peak sitting at the very top bin
-        The ADC is saturating. Lower lgGain, or lower inDac.
+        The ADC is saturating. Lower lgGain, or raise inDac.
     Dropped frames in the status line
         The USB link cannot keep up. Reduce the number of enabled
         channels or the event rate.
