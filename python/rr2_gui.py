@@ -2522,7 +2522,7 @@ TROUBLESHOOTING
         The threshold is in the noise, or unused channels are still
         enabled. Disable them, then raise DAC1.
     Peak sitting at the very top bin
-        The ADC is saturating. Lower lgGain, or lower inDac.
+        The ADC is saturating. Lower lgGain, or raise inDac.
     Peak low and broad for no obvious reason
         The hold delay is not landing on the shaper peak. Check that
         slow shaping is still on, then sweep the delay.
@@ -2886,7 +2886,7 @@ FILES
         הסף בתוך הרעש, או שערוצים לא בשימוש עדיין מופעלים. השבת אותם
         ואז העלה את DAC1.
     הפיק יושב בתא העליון ביותר
-        ה-ADC רווי. הורד את lgGain, או הורד את inDac.
+        ה-ADC רווי. הורד את lgGain, או העלה את inDac.
     הפיק נמוך ורחב בלי סיבה נראית לעין
         השהיית ה-hold אינה נוחתת על שיא ה-shaper. בדוק ש-slow
         shaping עדיין דלוק, ואז סרוק את ההשהיה.
