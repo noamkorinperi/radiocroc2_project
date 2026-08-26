@@ -33,6 +33,29 @@
  * One code per channel, not two: the board digitises only OUT_AMUXLG.
  * See radioroc2_daq.h.
  *
+ * Status payload:
+ *   0   4   uptime, ms since boot
+ *   4   4   trigger count
+ *   8   4   events read out cleanly
+ *   12  4   events whose readout failed
+ *   16  4   frames dropped for want of buffer
+ *   20  4   temperature, milli-Celsius (signed)
+ *   24  1   flags: 1 ASIC online, 2 TMP online, 4 timing ok,
+ *               8 the bus was found jammed at boot
+ *   25  1   cfg_status  - RR2_Status of the boot config sequence
+ *   26  1   read_status - RR2_Status of the last readout
+ *   27  1   commands completed, mod 256
+ *   28  1   of those, how many returned an error, mod 256
+ *   29  1   RR2_Status of the most recent command
+ *
+ * The last three are what makes a command result survivable. The
+ * reply to a typed command is bare text with no framing and can be
+ * lost, which looks exactly like a command that never ran. These
+ * ride inside the CRC and are resent every second, so "did the
+ * Apply land" is answered by the completed count moving, not by an
+ * "ok" that may never arrive. Appended at the end on purpose: a
+ * host that reads only the first 27 bytes still decodes correctly.
+ *
  * Transmission is buffered. The UART DMA carries one contiguous span at
  * a time, so frames are queued in a ring and pumped out by
  * USBStream_Task(). If the host stops reading the ring fills, and new
@@ -80,8 +103,12 @@ typedef struct {
     uint8_t  rr2_online;
     uint8_t  temp_online;
     uint8_t  timing_ok;
+    uint8_t  bus_jam;         /* SDA was stuck low at boot        */
     uint8_t  cfg_status;      /* RR2_Status of the config sequence  */
     uint8_t  read_status;     /* RR2_Status of the last readout     */
+    uint8_t  cmd_done;        /* commands completed, mod 256        */
+    uint8_t  cmd_failed;      /* of those, how many failed, mod 256 */
+    uint8_t  cmd_last;        /* RR2_Status of the most recent one  */
 } USBStream_Status;
 
 /* ------------------------------------------------------------------ */

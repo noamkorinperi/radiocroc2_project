@@ -39,8 +39,26 @@ static void reply(const char *s)
     (void)USBStream_SendText(s);
 }
 
+/* Every command that produces a result is counted here, and the counts
+   ride in the status frame. The reply below travels as bare text with
+   no framing of its own and can be lost - by a full ring, by a resync,
+   by anything that eats bytes - and a lost reply is indistinguishable
+   from a command that never ran. The counts cannot be lost the same
+   way: they sit inside a CRC protected frame that is resent every
+   second, so the host can ask "did my six writes complete" and get a
+   real answer even when not one of the six replies arrived. Written and
+   read from the main loop only, so the reads need no protection. */
+static uint8_t cmd_done   = 0u;   /* commands completed, wraps at 256  */
+static uint8_t cmd_failed = 0u;   /* of those, how many returned error */
+static uint8_t cmd_last   = 0u;   /* RR2_Status of the most recent one */
+
 static void reply_status(RR2_Status st)
 {
+    cmd_last = (uint8_t)st;
+    if (st != RR2_OK) cmd_failed++;
+    cmd_done++;                   /* bumped last, so a completion is
+                                     never visible to the host before
+                                     the failure that belongs to it */
     reply((st == RR2_OK) ? "ok\r\n" : "ERR: ASIC write failed\r\n");
 }
 
@@ -283,10 +301,13 @@ static void tokenize(void)
 /* ------------------------------------------------------------------ */
 void USBCmd_Init(void)
 {
-    rx_head  = 0u;
-    rx_tail  = 0u;
-    line_len = 0u;
-    overruns = 0u;
+    rx_head    = 0u;
+    rx_tail    = 0u;
+    line_len   = 0u;
+    overruns   = 0u;
+    cmd_done   = 0u;
+    cmd_failed = 0u;
+    cmd_last   = 0u;
 }
 
 void USBCmd_Feed(const uint8_t *data, uint32_t len)
@@ -331,3 +352,7 @@ uint32_t USBCmd_GetOverruns(void)
 {
     return overruns;
 }
+
+uint8_t USBCmd_GetDone(void)       { return cmd_done; }
+uint8_t USBCmd_GetFailed(void)     { return cmd_failed; }
+uint8_t USBCmd_GetLastStatus(void) { return cmd_last; }

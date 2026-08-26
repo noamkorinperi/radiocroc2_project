@@ -96,6 +96,10 @@ volatile uint8_t  g_rr2_sc_error = 0;
    debugger: RR2_OK (0) means the ASIC accepted the full config.    */
 volatile RR2_Status g_rr2_cfg_status = RR2_OK;
 volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
+/* 1 = SDA was found held low at boot and had to be clocked free. Worth
+   surfacing: it means something reset mid-frame, and the ASIC spent the
+   time since refusing every write. */
+volatile uint8_t    g_rr2_bus_jam    = 0;
 
 /* Most recent digitised event (~136 bytes, lives in .bss).         */
 RR2_Event g_rr2_event;
@@ -242,6 +246,14 @@ int main(void)
         }
     }
     /* breakpoint here, read found_id */
+    /* Free the bus before the first transaction. A reset that landed
+       inside a Slow Control frame leaves the ASIC holding SDA low, and
+       every write from here would fail until someone pulled power. */
+    if ((GPIOB->IDR & GPIO_PIN_9) == 0u) {
+        g_rr2_bus_jam = 1u;
+        (void)RR2_I2C_BusRecover();
+    }
+
     g_rr2_online = RR2_Bringup();
 
     if (g_rr2_online) {
@@ -428,9 +440,17 @@ static uint8_t RR2_Bringup(void)
  * keeps streaming, and it looks exactly like data. Only uptime_ms going
  * backwards in the status frame gives it away.
  *
- * inDac is deliberately NOT set here. It is the one parameter the sweep
- * changes per temperature point, so it is left wherever the host put it
- * last - 0x80 out of the shadow reset.
+ * inDac is pinned mid-scale. The sweep itself moves the HV supply, not
+ * this DAC - its whole span is 550 mV, about 25 C of drift, which is
+ * not enough to cover the range. What mid-scale buys is a trim that
+ * still works in both directions afterwards, roughly +-275 mV, and it
+ * keeps the sensor 276 mV further from the overvoltage where the low
+ * gain chain runs out of ceiling.
+ *
+ * The value equals RR2_CH_INDAC_DEFAULT, so this write changes nothing
+ * the shadow reset had not already done. It is here so the choice is
+ * stated where the experiment is configured, rather than inherited from
+ * a constant whose job is to mean "what the datasheet powers up as".
  */
 static RR2_Status RR2_ApplyExperimentConfig(void)
 {
@@ -459,6 +479,13 @@ static RR2_Status RR2_ApplyExperimentConfig(void)
             if (st != RR2_OK) return st;
         }
     }
+
+    /* Every channel, not just the window: the dark references are
+       supposed to report the same front end the signal channel runs
+       on, and an input DAC left elsewhere would offset their baseline
+       against it.                                                    */
+    st = RR2_Ctrl_SetInDac(RR2_CH_ALL, 128u);
+    if (st != RR2_OK) return st;
 
     /* Slow shaping, ~1.7 us peaking, hold delay stretched to match.
        Safe to run after the channel gating: the shaping setters touch
@@ -541,8 +568,12 @@ static void USB_SendStatusPeriodic(void)
     st.rr2_online     = g_rr2_online;
     st.temp_online    = g_temp_online;
     st.timing_ok      = g_rr2_timing_ok;
+    st.bus_jam        = g_rr2_bus_jam;
     st.cfg_status     = (uint8_t)g_rr2_cfg_status;
     st.read_status    = (uint8_t)g_rr2_read_status;
+    st.cmd_done       = USBCmd_GetDone();
+    st.cmd_failed     = USBCmd_GetFailed();
+    st.cmd_last       = USBCmd_GetLastStatus();
 
     (void)USBStream_SendStatus(&st);
 }

@@ -63,6 +63,22 @@ except ImportError:
 
 
 ADC_MAX = 4095                      # 12-bit ADC
+ADC_VREF_V = 3.3                    # VREF+ is tied to VDDA on the Nucleo
+
+# OUT_AMUXLG cannot swing past 1.32 V. That is the ASIC output buffer's
+# ceiling, not a setting, and nothing amplifies the line between the
+# ASIC and PA5 - so the top 60% of the ADC's range is unreachable and a
+# clipped event lands at LG_CEIL_CODE, never at 4095. Histogramming to
+# 4095 spent 60% of the axis on codes that cannot occur and, worse, put
+# the saturation detector somewhere the signal can never reach.
+LG_MAX_V = 1.32
+LG_CEIL_CODE = int(LG_MAX_V / ADC_VREF_V * (ADC_MAX + 1))       # 1638
+
+# A peak detector pinned at the ceiling reads the ceiling plus noise,
+# not more than it, so saturation shows up as a pile-up just below
+# LG_CEIL_CODE rather than as anything out of range. Call the top 1%
+# saturated.
+LG_SAT_CODE = LG_CEIL_CODE - max(8, LG_CEIL_CODE // 100)        # 1622
 STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "measurements")
 RAW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw")
 SHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
@@ -124,7 +140,7 @@ class Link:
         self._stop = threading.Event()
         self._thread = None
         self._dec = Decoder()
-        self._sim_state = {"rate": 180.0, "centre": 2400, "sigma": 90}
+        self._sim_state = {"rate": 180.0, "centre": 1100, "sigma": 41}
         # An open port proves nothing - the ST-Link enumerates whether or
         # not the firmware is running, and a wrong baud rate delivers
         # bytes that are pure noise. These are what tell the difference.
@@ -248,8 +264,10 @@ class Link:
                     lg = random.gauss(self._sim_state["centre"],
                                       self._sim_state["sigma"])
                 else:
-                    lg = random.expovariate(1 / 700.0)      # Compton-ish tail
-                lg = int(max(0, min(ADC_MAX, lg)))
+                    lg = random.expovariate(1 / 320.0)      # Compton-ish tail
+                # Clipped at the ASIC's ceiling, not the ADC's full
+                # scale, so the simulator can reproduce saturation.
+                lg = int(max(0, min(LG_CEIL_CODE, lg)))
                 self.frames.put({
                     "type": "event", "seq": seq,
                     "t_ms": int((now - t0) * 1000),
@@ -456,6 +474,7 @@ class LinkHealth:
         self.board = {}                # last status frame, as sent
         self.dropped_delta = 0
         self.bad_delta = 0
+        self.bus_jam_seen = False
         self._crc = 0
         self._byte_at = 0.0
 
@@ -483,6 +502,7 @@ class LinkHealth:
             gap = (frame.get("uptime_ms", 0) - prev.get("uptime_ms", 0)) / 1000.0
             if gap < 0:
                 self._flag(now, "the board reset - uptime went backwards")
+                self.bus_jam_seen = False      # a new boot, a new verdict
             else:
                 self.gap_worst = max(self.gap_worst, gap)
                 if gap > self.MISSED_BEAT_S:
@@ -505,6 +525,14 @@ class LinkHealth:
             self._flag(now, "ASIC offline - Slow Control is not answering")
         if not frame.get("timing_ok", True):
             self._flag(now, "DWT timing unavailable - hold delay is wrong")
+        # Once per boot, not once per frame. It says something happened
+        # before the firmware started, and the firmware dealt with it -
+        # raising it every second would pin the lamp amber for a fault
+        # that is already over, which is how cfg_status used to read.
+        if frame.get("bus_jam") and not self.bus_jam_seen:
+            self.bus_jam_seen = True
+            self._flag(now, "I2C was jammed at boot and was clocked free "
+                            "- something reset mid-transfer")
         if frame.get("cfg_status") or frame.get("read_status"):
             self._flag(now, "ASIC error cfg=%s read=%s"
                             % (frame.get("cfg_status"),
@@ -598,7 +626,7 @@ class LinkHealth:
 #  Histogram
 # ===================================================================
 class Histogram:
-    def __init__(self, bins=512, lo=0, hi=ADC_MAX):
+    def __init__(self, bins=512, lo=0, hi=LG_CEIL_CODE):
         self.reset(bins, lo, hi)
 
     def reset(self, bins=None, lo=None, hi=None):
@@ -611,15 +639,23 @@ class Histogram:
         self.counts = [0] * self.bins
         self.total = 0
         self.overflow = 0
+        self.saturated = 0
 
     @property
     def width(self):
         return (self.hi - self.lo) / float(self.bins)
 
     def add(self, value):
+        if value >= LG_SAT_CODE:
+            self.saturated += 1
         if value < self.lo or value > self.hi:
+            # Clamped into the end bin, not dropped. A clipped event is
+            # still an event, and a counter that only ran when the
+            # histogram threw data away is what hid saturation before:
+            # the driver already clamps to 0..4095 and the old range
+            # ended at 4095, so it could never fire at all.
             self.overflow += 1
-            return
+            value = min(max(value, self.lo), self.hi)
         idx = int((value - self.lo) / self.width)
         if idx >= self.bins:
             idx = self.bins - 1
@@ -701,7 +737,7 @@ class HistCanvas(tk.Canvas):
         if not self.hist or self.hist.total == 0:
             self.create_text((x0 + x1) / 2, (y0 + y1) / 2, fill=C_MUTED,
                              text="no data yet", font=("Segoe UI", 11))
-            self._axis_labels(x0, y0, x1, y1, 0, 0, ADC_MAX)
+            self._axis_labels(x0, y0, x1, y1, 0, 0, LG_CEIL_CODE)
             return
 
         hist = self.hist
@@ -765,6 +801,103 @@ class HistCanvas(tk.Canvas):
             py = y0 + (y1 - y0) * i / 5.0
             self.create_text(x0 - 6, py, text=f"{cv:.0f}", anchor="e",
                              fill=C_MUTED, font=("Segoe UI", 8))
+
+
+# ===================================================================
+#  Command confirmation
+# ===================================================================
+class CmdWatch:
+    """Did the commands actually run, or did the reply just go missing?
+
+    The "ok" a command answers with is bare text sharing the wire with
+    the binary frames, and text has no framing to protect it. So a lost
+    reply and a command that never ran look identical from here, which
+    is exactly the failure that lets a setting silently not apply.
+
+    The board therefore also counts, inside the status frame, how many
+    commands it has completed and how many of those failed. That frame
+    is CRC protected and resent every second, so the question worth
+    asking is not "did a reply come back" but "has the completed count
+    moved by as many as were sent". This watches that.
+    """
+
+    # The board sends status once a second and a single 'push' blocks it
+    # for 0.4 s, so an honest verdict can take two beats to arrive.
+    TIMEOUT_S = 4.0
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.done = None        # counters as the board last reported them
+        self.failed = None
+        self.reports = None     # does this firmware carry them at all?
+        self._job = None        # (label, count, done0, failed0, sent_at)
+
+    # -- inputs
+    def expect(self, label, count):
+        """Note that `count` commands were just sent under `label`.
+
+        The baseline is whatever the last status frame carried. It
+        cannot have moved between the send and this call: frames are
+        drained in pump(), which runs on the same Tk thread as the
+        button handler that sent them.
+        """
+        self._job = (label, count, self.done, self.failed, time.monotonic())
+
+    def on_frame(self, frame):
+        """Take the counters from a status frame. May return a verdict."""
+        if frame.get("type") != "status":
+            return None
+        done = frame.get("cmd_done")
+        if done is None:
+            self.reports = False
+        else:
+            self.reports = True
+            self.done = done
+            self.failed = frame.get("cmd_failed", 0)
+        return self.poll()
+
+    # -- output
+    def poll(self):
+        """The verdict, once there is one. (ok, message) or None.
+
+        Also call this on a timer: a batch that is never confirmed is
+        the whole point, and nothing arrives to trigger it.
+        """
+        if self._job is None:
+            return None
+        label, count, done0, failed0, sent_at = self._job
+
+        if self.reports is False:
+            self._job = None
+            return (None, "%s: this firmware does not report command "
+                          "results - the console is the only confirmation"
+                    % label)
+
+        if done0 is not None and self.done is not None:
+            # Both counters wrap at 256, so only differences mean anything.
+            ran = (self.done - done0) & 0xFF
+            bad = (self.failed - failed0) & 0xFF
+            if ran >= count:
+                self._job = None
+                if bad:
+                    return (False, "%s: the board ran all %d, and %d "
+                                   "FAILED on the ASIC" % (label, count, bad))
+                return (True, "%s: all %d confirmed by the board"
+                        % (label, count))
+
+        if time.monotonic() - sent_at > self.TIMEOUT_S:
+            self._job = None
+            if done0 is None:
+                return (False, "%s: NOT confirmed - no status frame to "
+                               "compare against. Do not trust the settings"
+                        % label)
+            ran = (self.done - done0) & 0xFF if self.done is not None else 0
+            return (False, "%s: NOT confirmed - the board completed %d of "
+                           "%d. Check the link before trusting the settings"
+                    % (label, ran, count))
+        return None
 
 
 # ===================================================================
@@ -863,6 +996,12 @@ def prune_measurements():
 # is read by someone who no longer remembers what patGain was for, so
 # the units travel with the number.
 SETTING_UNITS = {
+    "isotope": "what faced the crystal",
+    "oven_setpoint_c": "chamber setpoint, C",
+    "hv_supply_set_v": "supply setpoint, V",
+    "hv_measured_v": "at the supply output, V",
+    "v_channel_pins_v": "socket, sensor unplugged, V",
+    "operator_note": "",
     "inDac": "0-255, SiPM bias trim",
     "lgGain": "0-15, x0.5-8",
     "hgGain": "0-15, trigger only",
@@ -919,6 +1058,15 @@ def settings_sections(rec):
     """
     s = rec.get("settings")
     out = []
+
+    # First, because it is the half of the record nothing else can
+    # reconstruct. Blank fields are dropped rather than printed: an
+    # empty box is not a fact, and a printed empty box is how a
+    # question nobody answered turns into a zero.
+    cond = {k: v for k, v in (rec.get("conditions") or {}).items() if v != ""}
+    if cond:
+        out.append(("Run conditions, as typed", _rows(cond)))
+
     if not isinstance(s, dict):
         # Pre-snapshot record: everything that is known is at top level.
         out.append(("Acquisition", _rows({
@@ -1032,6 +1180,24 @@ def settings_text(rec):
     return "\n".join(lines) if lines else "no settings were saved with this run"
 
 
+# The flat block at the top of an export. The typed conditions sit up
+# here next to the label and not only down in their own section, so that
+# six exports of a thermal sweep can be stacked and sorted on the rows
+# that tell them apart.
+_RUN_HEADER = ("started", "label", "isotope", "oven_setpoint_c",
+               "hv_supply_set_v", "hv_measured_v", "v_channel_pins_v",
+               "duration_s", "channel", "source", "bins", "lo", "hi",
+               "total", "overflow", "saturated", "temp_c", "rate_cps",
+               "raw_file", "note", "operator_note")
+
+
+def _run_value(rec, key):
+    """One header value, from the record or from its conditions block."""
+    if key in rec:
+        return rec[key]
+    return (rec.get("conditions") or {}).get(key, "")
+
+
 def export_measurement(rec, path):
     """Write one measurement to .xlsx, or CSV if openpyxl is missing."""
     counts = rec["counts"]
@@ -1041,10 +1207,8 @@ def export_measurement(rec, path):
     if not HAVE_XLSX or path.lower().endswith(".csv"):
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            for k in ("started", "label", "duration_s", "channel", "source",
-                      "total", "overflow", "temp_c", "rate_cps", "raw_file",
-                      "note"):
-                w.writerow([k, rec.get(k, "")])
+            for k in _RUN_HEADER:
+                w.writerow([k, _run_value(rec, k)])
             for title, rows in settings_sections(rec):
                 w.writerow([])
                 w.writerow([title])
@@ -1078,10 +1242,11 @@ def export_measurement(rec, path):
 
     meta = wb.create_sheet("Metadata")
     meta.append(["Run"])
-    for k in ("started", "label", "duration_s", "channel", "source",
-              "bins", "lo", "hi", "total", "overflow", "temp_c", "rate_cps",
-              "raw_file", "note"):
-        meta.append([k, str(rec.get(k, ""))])
+    for k in _RUN_HEADER:
+        v = _run_value(rec, k)
+        # Numbers stay numbers here. The HV column of a six-point sweep
+        # is the x axis of a plot, and a column of text is not.
+        meta.append([k, v if isinstance(v, (int, float)) else str(v)])
     meta.append([])
     meta.append(["axis", "raw ADC counts on OUT_AMUXLG"])
     # One row per setting. A blob in a single cell is not something a
@@ -1464,6 +1629,9 @@ class PageSettings(Page):
                            values=["all"] + [str(i) for i in range(64)])
         cmb.grid(row=r, column=1, sticky="w", pady=3)
 
+        # Mid-scale, matching what the firmware pins at boot. The sweep
+        # moves the HV supply; this DAC stays where it can still trim
+        # in either direction afterwards.
         self.v_indac = self._spin(ch, "inDac (0-255)", 0, 255, 128, r := r + 1)
         self.v_glg = self._spin(ch, "lgGain (0-15)", 0, 15, 4, r := r + 1)
         self.v_tlg = self._spin(ch, "tauLG (0-15)", 0, 15, 14, r := r + 1)
@@ -1521,8 +1689,17 @@ class PageSettings(Page):
             .pack(side="left", padx=4)
         ttk.Button(gbar, text="Defaults", command=lambda: self.cmd("defaults"))\
             .pack(side="left")
-        ttk.Button(gbar, text="Push all", command=lambda: self.cmd("push"))\
+        ttk.Button(gbar, text="Push all",
+                   command=lambda: self.run("Push all", ["push"]))\
             .pack(side="left", padx=4)
+
+        # ---- what the board said about the last batch
+        # Above the console rather than in it: a scrolling log is where
+        # a failed Apply goes unnoticed, and this is the one line that
+        # must not.
+        self.lbl_result = ttk.Label(self, text="", style="Sub.TLabel",
+                                    anchor="w")
+        self.lbl_result.pack(fill="x", pady=(8, 0))
 
         # ---- console
         con = ttk.LabelFrame(self, text="Console", padding=8)
@@ -1557,11 +1734,45 @@ class PageSettings(Page):
         self.txt.see("end")
 
     def cmd(self, line):
+        """Send one command. True if it actually went out."""
         if not self.app.link.connected:
             messagebox.showwarning("Offline", "Connect to the board first.")
-            return
+            return False
         self.app.link.send(line)
         self.log("> " + line)
+        return True
+
+    def run(self, label, lines):
+        """Send a batch, then wait for the board to confirm it ran.
+
+        Every button that changes the ASIC goes through here. Waiting on
+        the replies would be the obvious thing and the wrong one: they
+        are unframed text and can be lost, and a lost "ok" is not the
+        same as a command that failed. The confirmation comes from the
+        counters in the status frame instead - see CmdWatch.
+        """
+        sent = 0
+        for line in lines:
+            if not self.cmd(line):
+                break
+            sent += 1
+        if not sent:
+            return 0
+        if self.app.link.sim:
+            # The simulator produces frames, not answers. Waiting four
+            # seconds to say so would only look like a fault.
+            self.set_result(None, "%s: sent %d - the simulator does not "
+                                  "execute commands" % (label, sent))
+            return sent
+        self.set_result(None, "%s: sent %d, waiting for the board ..."
+                        % (label, sent))
+        self.app.cmdwatch.expect(label, sent)
+        return sent
+
+    def set_result(self, ok, msg):
+        """ok: True confirmed, False failed or unconfirmed, None pending."""
+        style = {True: "Ok.TLabel", False: "Bad.TLabel"}.get(ok, "Sub.TLabel")
+        self.lbl_result.configure(text=msg, style=style)
 
     def send_raw(self):
         line = self.v_raw.get().strip()
@@ -1571,17 +1782,22 @@ class PageSettings(Page):
 
     def apply_channel(self):
         c = self.v_ch.get()
-        self.cmd(f"ch {c} indac {self.v_indac.get()}")
-        # One argument each: the firmware leaves the HG half of these
-        # registers untouched when it is omitted.
-        self.cmd(f"ch {c} gain {self.v_glg.get()}")
-        self.cmd(f"ch {c} slow {self.v_slg.get()}")
-        self.cmd(f"ch {c} tau {self.v_tlg.get()}")
-        self.cmd(f"ch {c} patgain {self.v_pat.get()}")
-        self.cmd(f"ch {c} trim {self.v_t1.get()} {self.v_t2.get()}")
+        self.run(f"Apply channel {c}", [
+            f"ch {c} indac {self.v_indac.get()}",
+            # One argument each: the firmware leaves the HG half of
+            # these registers untouched when it is omitted.
+            f"ch {c} gain {self.v_glg.get()}",
+            f"ch {c} slow {self.v_slg.get()}",
+            f"ch {c} tau {self.v_tlg.get()}",
+            f"ch {c} patgain {self.v_pat.get()}",
+            f"ch {c} trim {self.v_t1.get()} {self.v_t2.get()}",
+        ])
 
     def enable(self, on):
-        self.cmd(f"ch {self.v_ch.get()} {'on' if on else 'off'}")
+        word = "Enable" if on else "Disable"
+        c = self.v_ch.get()
+        self.run(f"{word} channel {c}",
+                 [f"ch {c} {'on' if on else 'off'}"])
 
     def dump(self):
         c = self.v_ch.get()
@@ -1591,11 +1807,13 @@ class PageSettings(Page):
         self.cmd(f"ch {c} dump")
 
     def apply_global(self):
-        self.cmd(f"th {self.v_d1.get()} {self.v_d2.get()} {self.v_dq.get()}")
-        self.cmd(f"delay {self.v_dly.get()} {self.v_slp.get()}")
-        self.cmd(f"trig {self.v_trig.get()}")
-        self.cmd(f"hold {'ext' if self.v_hold_ext.get() else 'int'}")
-        self.cmd(f"mux {self.v_mlg.get()}")
+        self.run("Apply global", [
+            f"th {self.v_d1.get()} {self.v_d2.get()} {self.v_dq.get()}",
+            f"delay {self.v_dly.get()} {self.v_slp.get()}",
+            f"trig {self.v_trig.get()}",
+            f"hold {'ext' if self.v_hold_ext.get() else 'int'}",
+            f"mux {self.v_mlg.get()}",
+        ])
 
     def form_values(self):
         """Everything on this page, as a dict.
@@ -1625,7 +1843,7 @@ class PageSettings(Page):
         }
 
     def preset_csi(self):
-        self.cmd("preset csi")
+        self.run("Preset CsI", ["preset csi"])
         # Mirror what the firmware preset does, so the form stays honest.
         self.v_slg.set(1)
         self.v_tlg.set(14)
@@ -1680,8 +1898,62 @@ class PageMeasure(Page):
         ttk.Entry(ctl, textvariable=self.v_label, width=28)\
             .grid(row=1, column=1, columnspan=3, sticky="w",
                   padx=(6, 18), pady=(10, 0))
-        ttk.Label(ctl, text="e.g.  T30_dac255", style="Sub.TLabel")\
+        ttk.Label(ctl, text="e.g.  T30_HV27.14", style="Sub.TLabel")\
             .grid(row=1, column=4, columnspan=3, sticky="w", pady=(10, 0))
+
+        # Facts about the bench that no wire carries. The board knows the
+        # ASIC registers and its own temperature; it cannot know what the
+        # HV supply was set to, what was sitting in front of the crystal,
+        # or what the chamber was told to do. Left to a run label these
+        # get typed differently every time and stop being sortable, so
+        # they get fields of their own and travel in the record.
+        cond = ttk.LabelFrame(self, text="Run conditions (typed, not measured by the board)",
+                              padding=12)
+        cond.pack(fill="x", pady=(0, 10))
+
+        def entry(parent, text, var, row, col, width=12, hint=""):
+            ttk.Label(parent, text=text).grid(row=row, column=col, sticky="w",
+                                              pady=3)
+            ttk.Entry(parent, textvariable=var, width=width)\
+                .grid(row=row, column=col + 1, sticky="w", padx=(6, 18), pady=3)
+            if hint:
+                ttk.Label(parent, text=hint, style="Sub.TLabel")\
+                    .grid(row=row, column=col + 2, sticky="w", pady=3)
+
+        ttk.Label(cond, text="Isotope").grid(row=0, column=0, sticky="w", pady=3)
+        self.v_isotope = tk.StringVar(value="")
+        # Blank is the default on purpose. "no source" is a real
+        # measurement - the background run the pedestal comes from - and
+        # a run that never said what was in front of it is not that.
+        ttk.Combobox(cond, textvariable=self.v_isotope, width=10,
+                     state="readonly",
+                     values=["", "Cs-137", "Co-60", "no source"])\
+            .grid(row=0, column=1, sticky="w", padx=(6, 18), pady=3)
+        ttk.Label(cond, text="blank = not stated", style="Sub.TLabel")\
+            .grid(row=0, column=2, sticky="w", pady=3)
+
+        self.v_oven = tk.StringVar(value="")
+        entry(cond, "Oven setpoint (C)", self.v_oven, 0, 3, 10,
+              "what the chamber was told, not what it reached")
+
+        self.v_hv_set = tk.StringVar(value="")
+        entry(cond, "HV supply set (V)", self.v_hv_set, 1, 0, 12)
+        self.v_hv_meas = tk.StringVar(value="")
+        entry(cond, "HV measured (V)", self.v_hv_meas, 1, 3, 12,
+              "at the supply output")
+
+        self.v_v_pins = tk.StringVar(value="")
+        entry(cond, "V at channel pins (V)", self.v_v_pins, 2, 0, 12)
+        ttk.Label(cond, text="across the socket with the sensor unplugged - "
+                             "this is the overvoltage the SiPM will see",
+                  style="Sub.TLabel")\
+            .grid(row=2, column=3, columnspan=3, sticky="w", pady=3)
+
+        ttk.Label(cond, text="Note").grid(row=3, column=0, sticky="w", pady=3)
+        self.v_note = tk.StringVar(value="")
+        ttk.Entry(cond, textvariable=self.v_note, width=72)\
+            .grid(row=3, column=1, columnspan=5, sticky="w", padx=(6, 0),
+                  pady=3)
 
         bar = ttk.Frame(self)
         bar.pack(fill="x")
@@ -1712,13 +1984,19 @@ class PageMeasure(Page):
         ttk.Button(bar, text="Save plot PNG", command=self.shot_plot)\
             .pack(side="right", padx=6)
 
-        self.canvas = HistCanvas(self, height=340)
-        self.canvas.pack(fill="both", expand=True, pady=12)
-
+        # From the bottom, and before the plot. Setup and Run conditions
+        # together ask for more height than a 740-pixel window has, and
+        # the packer starves whatever comes last - which would be this
+        # line, the one that says whether the silence is a dead link or
+        # simply no events. The canvas expands, so it absorbs the
+        # shortfall instead. Same reasoning as the History button bar.
         stat = ttk.Frame(self)
-        stat.pack(fill="x")
+        stat.pack(fill="x", side="bottom")
         self.lbl = ttk.Label(stat, text="idle", style="Sub.TLabel")
         self.lbl.pack(side="left")
+
+        self.canvas = HistCanvas(self, height=340)
+        self.canvas.pack(fill="both", expand=True, pady=12)
 
         self.hist = Histogram()
         self.canvas.set_hist(self.hist)
@@ -1751,7 +2029,7 @@ class PageMeasure(Page):
                     "A run started now may record nothing, or may lose "
                     "events without saying so.\n\nStart anyway?"):
                 return
-        self.hist.reset(self.v_bins.get(), 0, ADC_MAX)
+        self.hist.reset(self.v_bins.get(), 0, LG_CEIL_CODE)
         self.canvas.set_hist(self.hist)
         self._open_raw()
         self.running = True
@@ -1898,7 +2176,7 @@ class PageMeasure(Page):
             self.lbl.configure(
                 text=f"running {elapsed:6.1f} s | {self.hist.total} counts | "
                      f"{rate:6.1f} cps | {pk_txt} | T {self.last_temp:.1f} C | "
-                     f"overflow {self.hist.overflow}{raw_txt}"
+                     f"saturated {self.hist.saturated}{raw_txt}"
                      + self._silence_note(elapsed))
 
     def _silence_note(self, elapsed):
@@ -1944,6 +2222,31 @@ class PageMeasure(Page):
             },
         }
 
+    def _conditions_block(self):
+        """The typed bench conditions, numbers parsed where they parse.
+
+        A field that does not parse is kept as the operator wrote it
+        rather than dropped: "27.1, drifting" is worth more six months
+        later than a blank, even though nothing can sort it.
+        """
+        def num(var):
+            s = var.get().strip()
+            if not s:
+                return ""
+            try:
+                return float(s)
+            except ValueError:
+                return s
+
+        return {
+            "isotope": self.v_isotope.get().strip(),
+            "oven_setpoint_c": num(self.v_oven),
+            "hv_supply_set_v": num(self.v_hv_set),
+            "hv_measured_v": num(self.v_hv_meas),
+            "v_channel_pins_v": num(self.v_v_pins),
+            "operator_note": self.v_note.get().strip(),
+        }
+
     def save(self):
         if self.hist.total == 0:
             messagebox.showinfo("Nothing to save", "Acquire some data first.")
@@ -1962,11 +2265,13 @@ class PageMeasure(Page):
             "counts": self.hist.counts[:],
             "total": self.hist.total,
             "overflow": self.hist.overflow,
+            "saturated": self.hist.saturated,
             "temp_c": round(self.last_temp, 2),
             "rate_cps": round(self.hist.total / elapsed, 2) if elapsed else 0,
             "label": self.v_label.get().strip(),
             "raw_file": os.path.basename(self.raw_path) if self.raw_path else "",
             "note": "simulator" if self.app.link.sim else "",
+            "conditions": self._conditions_block(),
             "settings": self._settings_block(),
             # Saved as evidence, not decoration: a spectrum taken across
             # a link that dropped frames is a spectrum with a hole in it,
@@ -2003,10 +2308,13 @@ class PageHistory(Page):
             .pack(side="left", padx=12)
         ttk.Button(top, text="Refresh", command=self.reload).pack(side="right")
 
-        cols = ("started", "label", "duration_s", "channel", "total",
-                "rate_cps", "temp_c", "overflow", "link")
+        # isotope and the chamber setpoint sit next to the label because
+        # they are what tells six runs of one sweep apart at a glance -
+        # temp_c is what the board felt, which is not the same question.
+        cols = ("started", "label", "isotope", "oven_c", "duration_s",
+                "channel", "total", "rate_cps", "temp_c", "saturated", "link")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
-        widths = (150, 140, 80, 70, 90, 90, 70, 75, 80)
+        widths = (140, 130, 70, 65, 75, 60, 80, 80, 65, 70, 75)
         for c, w in zip(cols, widths):
             self.tree.heading(c, text=c.replace("_", " "))
             self.tree.column(c, width=w, anchor="center")
@@ -2066,10 +2374,11 @@ class PageHistory(Page):
         for i, r in enumerate(self.records):
             self.tree.insert("", "end", iid=str(i), values=(
                 r.get("started", ""), r.get("label", ""),
+                _run_value(r, "isotope"), _run_value(r, "oven_setpoint_c"),
                 r.get("duration_s", ""),
                 r.get("channel", ""), r.get("total", ""),
                 r.get("rate_cps", ""), r.get("temp_c", ""),
-                r.get("overflow", ""), link_verdict(r)))
+                r.get("saturated", ""), link_verdict(r)))
         self.canvas.set_hist(None)
         self.show_settings("select a measurement to see the settings it "
                            "was taken under")
@@ -2208,14 +2517,18 @@ WHAT EVERY SETTING DOES - PER CHANNEL
         because OUT_AMUXLG is the only signal on this board that
         reaches an ADC.
         Raise it and the spectrum stretches towards higher ADC
-        channels. Too far and the photopeak piles up against 4095: the
-        peak stops moving, grows a hard edge, and the overflow counter
-        on the Measure page starts climbing.
+        channels. Too far and the photopeak piles up against 1638: the
+        peak stops moving, grows a hard edge, and the saturated counter
+        on the Measure page starts climbing. That ceiling belongs to the
+        ASIC, not to the ADC - OUT_AMUXLG cannot output more than
+        1.32 V, which is 1638 of the 4095 codes the ADC could digitise,
+        and nothing amplifies the line in between.
         Lower it and the spectrum compresses towards zero. Too far and
         the whole thing lives in the first few bins, where the
         resolution is limited by how coarsely it is being digitised.
-        Aim to put the photopeak at roughly two thirds of full scale,
-        which leaves headroom for a higher energy line.
+        Aim to put the photopeak at roughly two thirds of the 1638
+        ceiling - about 1100 codes - which leaves headroom for a higher
+        energy line.
 
     tauLG  (0-15, default 14 under Preset CsI)
         Peaking time of the low-gain shaper, as an index. The step is
@@ -2347,8 +2660,8 @@ WHAT EVERY SETTING DOES - MEASURE PAGE
         recoverable afterwards.
 
     Bins  (128-2048)
-        How finely the 0-4095 ADC range is divided. 512 bins is 8 ADC
-        codes per bin.
+        How finely the reachable 0-1638 range is divided. 512 bins is
+        a little over 3 ADC codes per bin.
         More bins resolve a narrow peak better but need proportionally
         more counts before the shape stops being noise. Fewer bins give
         a smooth curve quickly, at the cost of knowing exactly where
@@ -2361,8 +2674,34 @@ WHAT EVERY SETTING DOES - MEASURE PAGE
 
     Run label
         Names the raw CSV and the screenshots, and shows up in History.
-        Put the temperature point and the DAC setting in it. It is what
-        tells six runs of a sweep apart afterwards.
+        Put the temperature point and the HV in it. It is what tells six
+        runs of a sweep apart afterwards.
+
+    Run conditions  (isotope, oven setpoint, three HV fields, note)
+        Facts about the bench that no wire carries. The board reports
+        its own temperature and can be asked what the ASIC registers
+        hold. It has no idea what the HV supply was set to, what was in
+        front of the crystal, or what the chamber was told to do.
+
+        Isotope is blank until you say otherwise. "no source" is a real
+        measurement - the background run a pedestal comes from - and a
+        run that never said what it was pointed at is not that run.
+
+        Oven setpoint is what the chamber was told. temp_c, beside it in
+        History, is what the board felt. The gap between them is the
+        thermal gradient, which is the reason to keep both.
+
+        HV supply set and HV measured are the supply's own two numbers.
+        V at channel pins is the third and the most useful: measured
+        across the socket with the sensor unplugged, it is HV minus
+        whatever the input DAC holds the input at, and that difference
+        is the overvoltage the SiPM will actually see.
+
+        All six travel with the run: History, the settings pane, and the
+        Metadata sheet of an Excel export - numbers stored as numbers,
+        so a sweep can be plotted against them. They are deliberately
+        not remembered between sessions. A stale HV quietly attaching
+        itself to tomorrow's run is worse than an empty field.
 
     log scale
         Vertical axis only. Makes the Compton continuum and any small
@@ -2428,6 +2767,22 @@ IS THE LINK ACTUALLY WORKING
     question and waits for the answer, which proves it is also
     listening. A link where frames arrive but commands go nowhere looks
     perfectly healthy until a setting silently fails to apply.
+
+    Apply and Push all do not take the reply as proof. The "ok" a
+    command answers with is bare text sharing the wire with the frames,
+    and text has no CRC to survive on - a lost reply and a command that
+    never ran look identical. So the board also counts, inside the
+    status frame, how many commands it has completed and how many of
+    those failed, and the line above the console reports what those
+    counters actually did:
+
+        green   every command in the batch completed on the board
+        red     the board ran them and the ASIC refused a write, or
+                nothing was confirmed within four seconds
+        grey    sent, still waiting
+
+    Green there is the only thing that means a setting applied. Nothing
+    on this page is confirmed by the console filling with "ok".
 
     During a run the line under the plot says which kind of quiet you
     have: LINK DOWN means the seconds passing are not being recorded at
@@ -2514,15 +2869,25 @@ TROUBLESHOOTING
         Counts recorded in this state are incomplete.
     The lamp is green and Test link gets no reply
         Frames are coming back but commands are not getting through.
-        Settings will appear to apply and will not.
+        Settings will appear to apply and will not. The line above the
+        console is what settles it, not the console.
+    Apply says NOT confirmed
+        The board did not report those commands as completed within
+        four seconds - either they never arrived, or the link is losing
+        traffic in the direction that carries them. Do not trust the
+        settings until an Apply comes back green. This is not the same
+        as an Apply that comes back red saying commands FAILED: that
+        one reached the board and the ASIC refused the write, which is
+        a Slow Control fault, not a link fault.
     No events at all, link green
         Check that the channel is enabled, that the LG AMUX buffer is
         on, and that the threshold is not far above the pulse height.
     Enormous count rate
         The threshold is in the noise, or unused channels are still
         enabled. Disable them, then raise DAC1.
-    Peak sitting at the very top bin
-        The ADC is saturating. Lower lgGain, or raise inDac.
+    Peak sitting at the very top bin, saturated counter climbing
+        The ASIC's LG output is clipping at its 1.32 V ceiling. The ADC
+        is nowhere near full scale. Lower lgGain, or raise inDac.
     Peak low and broad for no obvious reason
         The hold delay is not landing on the shaper peak. Check that
         slow shaping is still on, then sweep the delay.
@@ -2541,7 +2906,7 @@ FILES
     carry the baseline. Analysis that needs a pedestal needs this file.
 
     Screenshots go to the screenshots folder as PNG, named the same way:
-    spectrum_20260824_113000_T30_dac255.png.
+    spectrum_20260824_113000_T30_HV27.14.png.
 
     Put the temperature point and the DAC setting in "Run label" before
     starting. It names the raw file and shows up in History, which is
@@ -2608,12 +2973,15 @@ FILES
         x8 לאורך שישה עשר הצעדים. זהו הכפתור לגובה הפולס, כי
         OUT_AMUXLG הוא האות היחיד בלוח הזה שמגיע ל-ADC.
         העלאה שלו מותחת את הספקטרום כלפי ערוצי ADC גבוהים יותר. יותר
-        מדי, והפוטו-פיק נערם על 4095: הפיק מפסיק לזוז, מקבל קצה חד,
-        ומונה ה-overflow בעמוד Measure מתחיל לטפס.
+        מדי, והפוטו-פיק נערם על 1638: הפיק מפסיק לזוז, מקבל קצה חד,
+        ומונה ה-saturated בעמוד Measure מתחיל לטפס. התקרה הזו
+        שייכת ל-ASIC, לא ל-ADC: OUT_AMUXLG לא מוציא יותר מ-1.32V, שהם
+        1638 קודים מתוך 4095 שה-ADC יודע לדגום, ואין מגבר ביניהם.
         הורדה שלו דוחסת את הספקטרום לכיוון האפס. יותר מדי, וכל
         הספקטרום חי בתאים הראשונים, שם הרזולוציה מוגבלת על ידי
         גסות הדיגיטציה.
-        כוון לפוטו-פיק בערך בשני שלישים מהסקאלה המלאה, מה שמשאיר
+        כוון לפוטו-פיק בערך בשני שלישים מהתקרה 1638 - כ-1100
+        קודים - מה שמשאיר
         מקום לקו אנרגיה גבוה יותר.
 
     tauLG  (0-15, ברירת מחדל 14 תחת Preset CsI)
@@ -2728,8 +3096,8 @@ FILES
         את הפדסטל - לניתנים לשחזור בדיעבד.
 
     Bins  (128-2048)
-        לכמה תאים מחולק טווח ה-ADC 0-4095. 512 תאים הם 8 קודי ADC
-        לתא.
+        לכמה תאים מחולק הטווח הבר-השגה 0-1638. 512 תאים הם קצת
+        יותר מ-3 קודי ADC לתא.
         יותר תאים מפרידים פיק צר טוב יותר, אבל דורשים פי כמה יותר
         ספירות עד שהצורה מפסיקה להיות רעש. פחות תאים נותנים עקומה
         חלקה מהר, במחיר של דיוק במיקום מרכז הפיק. שינוי הערך מנקה את
@@ -2741,8 +3109,31 @@ FILES
 
     Run label
         נותן שם לקובץ ה-raw ולצילומי המסך, ומופיע ב-History. כתוב בו
-        את נקודת הטמפרטורה ואת ערך ה-DAC. זה מה שיבדיל בין שש ריצות
-        של סריקה אחר כך.
+        את נקודת הטמפרטורה ואת ה-HV. זה מה שיבדיל בין שש ריצות של
+        סריקה אחר כך.
+
+    Run conditions  (איזוטופ, טמפרטורת תנור, שלושה שדות HV, הערה)
+        עובדות על השולחן ששום חוט לא נושא. הלוח מדווח על הטמפרטורה
+        שלו ואפשר לשאול אותו מה יש ברגיסטרים של ה-ASIC. הוא לא יודע
+        למה הוגדר ספק ה-HV, מה עמד מול הגביש, או מה נאמר לתא.
+
+        Isotope נשאר ריק עד שתגיד אחרת. "no source" היא מדידה אמיתית -
+        ריצת הרקע שממנה מגיע הפדסטל - וריצה שמעולם לא אמרה מול מה
+        היא עמדה איננה הריצה הזו.
+
+        Oven setpoint הוא מה שנאמר לתא. temp_c, לידו ב-History, הוא מה
+        שהלוח הרגיש. ההפרש ביניהם הוא הגרדיאנט התרמי, וזו הסיבה
+        לשמור את שניהם.
+
+        HV supply set ו-HV measured הם שני המספרים של הספק עצמו.
+        V at channel pins הוא השלישי והמועיל מכולם: נמדד על השקע כשהחיישן
+        מנותק, והוא HV פחות מה שה-input DAC מחזיק עליו את הכניסה -
+        וההפרש הזה הוא מתח היתר שה-SiPM באמת יראה.
+
+        כל השישה נוסעים עם הריצה: ב-History, בחלונית ההגדרות, ובגיליון
+        Metadata של ייצוא Excel - מספרים נשמרים כמספרים, כך שאפשר
+        לשרטט סריקה מולם. הם בכוונה לא נזכרים בין הרצות. HV ישן
+        שנדבק בשקט לריצה של מחר גרוע יותר משדה ריק.
 
     log scale
         ציר אנכי בלבד. מאפשר לראות את רצף Compton ופיקים קטנים לצד
@@ -2800,6 +3191,20 @@ FILES
     משדר; Test link שואל אותו שאלה ומחכה לתשובה, מה שמוכיח שהוא גם
     מקשיב. קישור שבו מסגרות מגיעות אבל פקודות הולכות לאיבוד נראה
     בריא לגמרי - עד שהגדרה נכשלת בשקט.
+
+    Apply ו-Push all אינם מסתמכים על התשובה כהוכחה. ה-"ok" שפקודה
+    עונה הוא טקסט חשוף שחולק את הקו עם המסגרות, ולטקסט אין CRC לשרוד
+    בעזרתו - תשובה שאבדה ופקודה שמעולם לא רצה נראות זהות. לכן הלוח גם
+    סופר, בתוך מסגרת הסטטוס, כמה פקודות השלים וכמה מהן נכשלו, והשורה
+    מעל הקונסולה מדווחת מה המונים האלה באמת עשו:
+
+        ירוק   כל הפקודות באצווה הושלמו בלוח
+        אדום   הלוח הריץ אותן וה-ASIC סירב לכתיבה, או ששום דבר לא
+               אושר בתוך ארבע שניות
+        אפור   נשלח, עדיין ממתין
+
+    ירוק שם הוא הדבר היחיד שמשמעותו שההגדרה הוחלה. שום דבר בעמוד הזה
+    לא מאושר על ידי קונסולה שמתמלאת ב-"ok".
 
     בזמן ריצה השורה מתחת לגרף אומרת איזה סוג של שקט זה: LINK DOWN
     פירושו שהשניות שעוברות אינן נרשמות בכלל, ואילו
@@ -2878,15 +3283,23 @@ FILES
         הזה אינן שלמות.
     הנורה ירוקה ו-Test link לא מקבל תשובה
         מסגרות חוזרות אבל פקודות אינן עוברות. הגדרות ייראו כאילו
-        הוחלו, ולא יוחלו.
+        הוחלו, ולא יוחלו. השורה מעל הקונסולה היא שמכריעה, לא
+        הקונסולה.
+    Apply אומר NOT confirmed
+        הלוח לא דיווח שהפקודות האלה הושלמו בתוך ארבע שניות - או
+        שמעולם לא הגיעו, או שהקישור מאבד תעבורה בכיוון שנושא אותן. אל
+        תסמוך על ההגדרות עד ש-Apply יחזור ירוק. זה לא אותו דבר כמו
+        Apply שחוזר אדום ואומר שפקודות FAILED: זה הגיע ללוח וה-ASIC
+        סירב לכתיבה, כלומר תקלת Slow Control ולא תקלת קישור.
     אין אירועים בכלל, נורה ירוקה
         בדוק שהערוץ מופעל, שמאגר ה-AMUX של LG דלוק, ושהסף אינו הרבה
         מעל גובה הפולס.
     קצב ספירה עצום
         הסף בתוך הרעש, או שערוצים לא בשימוש עדיין מופעלים. השבת אותם
         ואז העלה את DAC1.
-    הפיק יושב בתא העליון ביותר
-        ה-ADC רווי. הורד את lgGain, או העלה את inDac.
+    הפיק יושב בתא העליון ביותר, ומונה ה-saturated מטפס
+        מוצא ה-LG של ה-ASIC נחתך על תקרת ה-1.32V שלו. ה-ADC לא
+        מתקרב בכלל לסקאלה המלאה. הורד את lgGain, או העלה את inDac.
     הפיק נמוך ורחב בלי סיבה נראית לעין
         השהיית ה-hold אינה נוחתת על שיא ה-shaper. בדוק ש-slow
         shaping עדיין דלוק, ואז סרוק את ההשהיה.
@@ -2905,7 +3318,7 @@ FILES
     את הקובץ הזה.
 
     צילומי מסך הולכים לתיקיית screenshots כ-PNG, עם אותה שיטת שמות:
-    spectrum_20260824_113000_T30_dac255.png.
+    spectrum_20260824_113000_T30_HV27.14.png.
 
     כתוב את נקודת הטמפרטורה ואת ערך ה-DAC ב-Run label לפני שאתה
     מתחיל. זה נותן שם לקובץ הגולמי ומופיע ב-History, וזה מה שיבדיל
@@ -3077,6 +3490,7 @@ class App(tk.Tk):
         # says it is set to, and whether it is still talking.
         self.state = DeviceState()
         self.health = LinkHealth()
+        self.cmdwatch = CmdWatch()
         self._health_at = 0.0
         self._style()
 
@@ -3226,6 +3640,7 @@ class App(tk.Tk):
                 break
             drained += 1
             self.health.on_frame(frame)
+            self.show_cmd_verdict(self.cmdwatch.on_frame(frame))
             self.pages["measure"].feed(frame)
 
         while True:
@@ -3243,9 +3658,27 @@ class App(tk.Tk):
             self._health_at = now
             self.health.on_stats(self.link.stats())
             self.refresh_health()
+            # A batch that is never confirmed produces no frame to
+            # notice it by, so the timeout has to be asked, not awaited.
+            self.show_cmd_verdict(self.cmdwatch.poll())
 
         self.pages["measure"].tick()
         self.after(40, self.pump)
+
+    # -- command confirmation
+    def show_cmd_verdict(self, verdict):
+        """Put one verdict everywhere it needs to be.
+
+        The status bar because it is where the eye is after pressing a
+        button, the page label because a toast expires and this must
+        not, and the console because that is the record.
+        """
+        if verdict is None:
+            return
+        ok, msg = verdict
+        self.toast(msg)
+        self.pages["settings"].set_result(ok, msg)
+        self.pages["settings"].log("  " + msg)
 
     # -- link health
     def refresh_health(self):

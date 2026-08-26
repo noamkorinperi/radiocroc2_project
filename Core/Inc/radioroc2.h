@@ -78,6 +78,14 @@ typedef enum {
 /** Bind the driver to an I2C handle. Call once, after MX_I2C1_Init(). */
 void RR2_Init(I2C_HandleTypeDef *hi2c);
 
+/**
+ * @brief Free the bus if a slave is still holding it. Call before use.
+ *
+ * @return 1 if the bus is usable (already was, or has been freed),
+ *         0 if SDA is still held low and only power will clear it.
+ */
+uint8_t RR2_I2C_BusRecover(void);
+
 /** Stage-1 bring-up: does the ASIC ACK on its Chip ID? (HAL_OK = yes) */
 HAL_StatusTypeDef RR2_IsReady(uint32_t trials);
 

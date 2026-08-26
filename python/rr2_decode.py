@@ -245,7 +245,7 @@ class Decoder:
         if ftype == FRAME_STATUS:
             (uptime, trig, ok, bad, drop, temp,
              flags, cfg_st, rd_st) = struct.unpack_from("<IIIIIiBBB", p, 0)
-            return {
+            out = {
                 "type": "status",
                 "uptime_ms": uptime,
                 "triggers": trig,
@@ -256,9 +256,26 @@ class Decoder:
                 "rr2_online": bool(flags & 0x01),
                 "temp_online": bool(flags & 0x02),
                 "timing_ok": bool(flags & 0x04),
+                # SDA was found held low at boot and clocked free.
+                # A boot-time event, not a running condition.
+                "bus_jam": bool(flags & 0x08),
                 "cfg_status": cfg_st,
                 "read_status": rd_st,
             }
+
+            # Command result counters, appended after the original 27
+            # bytes. A reply to a typed command is unframed text and can
+            # be lost, which reads exactly like a command that never
+            # ran; these ride inside the CRC and are resent every
+            # second, so the host can confirm a batch by watching the
+            # completed count move. Read conditionally, because firmware
+            # built before they existed still sends the shorter frame.
+            if len(p) >= 30:
+                done, failed, last = struct.unpack_from("<BBB", p, 27)
+                out["cmd_done"] = done
+                out["cmd_failed"] = failed
+                out["cmd_last"] = last
+            return out
 
         return {"type": "unknown", "ftype": ftype, "raw": p}
 
