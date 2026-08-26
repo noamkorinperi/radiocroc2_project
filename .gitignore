@@ -32,6 +32,22 @@ venv/
 /python/gui_prefs.json
 
 # ---------------------------------------------------------------
+# STM32CubeIDE per-workspace state. language.settings.xml carries an
+# env-hash that changes whenever the toolchain environment shifts, so
+# it turns up modified on its own and gets committed by accident; the
+# other two are a favourites list and a pair of opaque hashes. None of
+# it describes the project.
+#
+# The contents are ignored rather than the directory, because git will
+# not descend into an ignored directory and the one file worth keeping
+# lives inside it: encoding/<project>=UTF-8 is a real project setting,
+# it never churns, and without it a fresh clone opens the sources in
+# whatever codepage the machine defaults to.
+# ---------------------------------------------------------------
+/.settings/*
+!/.settings/org.eclipse.core.resources.prefs
+
+# ---------------------------------------------------------------
 # Editor / OS noise
 # ---------------------------------------------------------------
 .vscode/
