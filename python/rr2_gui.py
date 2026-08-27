@@ -92,6 +92,17 @@ LG_CEIL_CODE = int(LG_MAX_V / ADC_VREF_V * (ADC_MAX + 1))       # 1638
 # LG_CEIL_CODE rather than as anything out of range. Call the top 1%
 # saturated.
 LG_SAT_CODE = LG_CEIL_CODE - max(8, LG_CEIL_CODE // 100)        # 1622
+
+# OUT_AMUXHG has never been put on the scope. Until it is, these assume
+# the HG buffer clips where the LG one does - 1.32 V - because it is
+# the same buffer design driving the same kind of pin, not because
+# anyone measured it. PENDING MEASUREMENT: drive PA4 into saturation,
+# read the plateau, and replace HG_MAX_V. What must not happen is a
+# quiet fallback to 4095 - that is exactly the mistake the LG comment
+# above exists to record.
+HG_MAX_V = 1.32                                                 # assumed = LG
+HG_CEIL_CODE = int(HG_MAX_V / ADC_VREF_V * (ADC_MAX + 1))       # 1638
+HG_SAT_CODE = HG_CEIL_CODE - max(8, HG_CEIL_CODE // 100)        # 1622
 STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "measurements")
 RAW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw")
 SHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
@@ -153,7 +164,11 @@ class Link:
         self._stop = threading.Event()
         self._thread = None
         self._dec = Decoder()
-        self._sim_state = {"rate": 180.0, "centre": 1100, "sigma": 41}
+        # "hg" mirrors the firmware's runtime switch: off after reset,
+        # like the real board, so the HG page's "readout is off" path
+        # is reachable in the simulator too.
+        self._sim_state = {"rate": 180.0, "centre": 1100, "sigma": 41,
+                           "hg": False}
         # An open port proves nothing - the ST-Link enumerates whether or
         # not the firmware is running, and a wrong baud rate delivers
         # bytes that are pure noise. These are what tell the difference.
@@ -226,6 +241,12 @@ class Link:
     def send(self, line):
         """Send one text command. Returns True if it went out."""
         if self.sim:
+            # The one command the sim honours rather than just echoing:
+            # without it the HG page could never be exercised end to
+            # end, because nothing would ever turn the HG block on.
+            parts = line.strip().lower().split()
+            if len(parts) == 2 and parts[0] == "hg" and parts[1] in ("0", "1"):
+                self._sim_state["hg"] = (parts[1] == "1")
             self.text.put(f"[sim] {line}")
             return True
         if not self.ser:
@@ -281,12 +302,23 @@ class Link:
                 # Clipped at the ASIC's ceiling, not the ADC's full
                 # scale, so the simulator can reproduce saturation.
                 lg = int(max(0, min(LG_CEIL_CODE, lg)))
+                # The same pulse through the high gain chain, roughly
+                # 8x - so the photopeak pins at the HG ceiling and only
+                # the low end keeps structure. That is what the real HG
+                # path does to this source, and the pile-up just below
+                # HG_SAT_CODE is what the page must show, not hide.
+                if self._sim_state["hg"]:
+                    hg = [int(max(0, min(HG_CEIL_CODE,
+                                         lg * 8.0 + random.gauss(0, 12))))]
+                else:
+                    hg = []
                 self.frames.put({
                     "type": "event", "seq": seq,
                     "t_ms": int((now - t0) * 1000),
                     "temp_c": 24.8 + 0.4 * random.random(),
                     "first_ch": 0, "count": 1,
                     "lg": [lg],
+                    "hg": hg,
                 })
             if now >= next_status:
                 next_status = now + 1.0
@@ -639,7 +671,10 @@ class LinkHealth:
 #  Histogram
 # ===================================================================
 class Histogram:
-    def __init__(self, bins=512, lo=0, hi=LG_CEIL_CODE):
+    def __init__(self, bins=512, lo=0, hi=LG_CEIL_CODE, sat_code=LG_SAT_CODE):
+        # Which code counts as "pinned at the ceiling" depends on which
+        # ceiling - the HG page hands in its own.
+        self.sat_code = sat_code
         self.reset(bins, lo, hi)
 
     def reset(self, bins=None, lo=None, hi=None):
@@ -659,7 +694,7 @@ class Histogram:
         return (self.hi - self.lo) / float(self.bins)
 
     def add(self, value):
-        if value >= LG_SAT_CODE:
+        if value >= self.sat_code:
             self.saturated += 1
         if value < self.lo or value > self.hi:
             # Clamped into the end bin, not dropped. A clipped event is
@@ -750,7 +785,10 @@ class HistCanvas(tk.Canvas):
         if not self.hist or self.hist.total == 0:
             self.create_text((x0 + x1) / 2, (y0 + y1) / 2, fill=C_MUTED,
                              text="no data yet", font=("Segoe UI", 11))
-            self._axis_labels(x0, y0, x1, y1, 0, 0, LG_CEIL_CODE)
+            # Label the axis of the histogram that will fill, not the
+            # LG default - the HG page's empty plot has its own range.
+            hi = self.hist.hi if self.hist else LG_CEIL_CODE
+            self._axis_labels(x0, y0, x1, y1, 0, 0, hi)
             return
 
         hist = self.hist
@@ -1529,6 +1567,8 @@ class PageMain(Page):
                          "thresholds, per-channel enables", "settings"),
             ("Measure", "Run an acquisition and watch the\n"
                         "spectrum accumulate live", "measure"),
+            ("Measure HG", "The same acquisition on the high\n"
+                           "gain path - needs 'hg 1' on", "hg"),
             ("Threshold scan", "Sweep DAC1 and find where the rate\n"
                                "stops being the source", "scan"),
             ("History", "Saved runs, the settings they were\n"
@@ -2121,7 +2161,11 @@ class PageMeasure(Page):
                 "being kept.")
             return
         self.raw_writer = csv.writer(self.raw_fh)
-        self.raw_writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg"])
+        # The hg column is present even when HG readout is off - same
+        # rule as rr2_decode: a capture that toggled 'hg' mid-run still
+        # loads as one consistent table, with blanks where there was
+        # nothing, not zeros where nothing was measured.
+        self.raw_writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg", "hg"])
 
     def _close_raw(self):
         if self.raw_fh:
@@ -2159,9 +2203,11 @@ class PageMeasure(Page):
         if self.raw_writer:
             first = frame["first_ch"]
             temp = f"{frame['temp_c']:.3f}"
+            hg = frame.get("hg") or ()
             for i in range(frame["count"]):
                 self.raw_writer.writerow([frame["seq"], frame["t_ms"], temp,
-                                          first + i, frame["lg"][i]])
+                                          first + i, frame["lg"][i],
+                                          hg[i] if hg else ""])
             self.raw_rows += frame["count"]
 
         ch = self.v_ch.get()
@@ -2321,6 +2367,301 @@ class PageMeasure(Page):
                      "only the values from the Settings form were saved.")
         messagebox.showinfo("Saved", note)
         self.app.pages["history"].reload()
+
+
+class PageHG(Page):
+    """The Measure page again, pointed at the high gain block.
+
+    Same acquisition, different signal: OUT_AMUXHG rides in the same
+    event frames as LG, but only while the firmware's 'hg 1' switch is
+    on, and the board resets with it off. The one design decision here
+    is what to do with an event that arrives without the HG block: it
+    is counted and named, never plotted. Histogramming it as zero
+    would build a tall fake peak at the origin out of data that was
+    never taken, which is the same lie in a different place as the
+    4095 ceiling was.
+    """
+    title = "Measure HG"
+
+    def build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Button(top, text="< Main", command=lambda: self.app.show("main"))\
+            .pack(side="left")
+        ttk.Label(top, text="Acquisition - high gain", style="H1.TLabel")\
+            .pack(side="left", padx=12)
+
+        ctl = ttk.LabelFrame(self, text="Setup", padding=12)
+        ctl.pack(fill="x", pady=10)
+
+        ttk.Label(ctl, text="Channel").grid(row=0, column=0, sticky="w")
+        self.v_ch = tk.IntVar(value=0)
+        ttk.Spinbox(ctl, from_=0, to=63, textvariable=self.v_ch, width=6)\
+            .grid(row=0, column=1, padx=(6, 18))
+
+        ttk.Label(ctl, text="Bins").grid(row=0, column=2, sticky="w")
+        self.v_bins = tk.IntVar(value=512)
+        ttk.Combobox(ctl, textvariable=self.v_bins, width=7, state="readonly",
+                     values=[128, 256, 512, 1024, 2048])\
+            .grid(row=0, column=3, padx=(6, 18))
+
+        ttk.Label(ctl, text="Duration (s, 0 = manual)")\
+            .grid(row=0, column=4, sticky="w")
+        self.v_dur = tk.IntVar(value=60)
+        ttk.Spinbox(ctl, from_=0, to=36000, textvariable=self.v_dur, width=8)\
+            .grid(row=0, column=5, padx=6)
+
+        # This page does not send 'hg 1' behind your back - flipping an
+        # ASIC register is a settings change, and those happen where
+        # settings happen. It says, loudly, when the frames arrive
+        # without HG.
+        ttk.Label(ctl, text="source: OUT_AMUXHG (high gain - needs 'hg 1')",
+                  style="Sub.TLabel")\
+            .grid(row=0, column=6, sticky="w", padx=(18, 0))
+
+        ttk.Label(ctl, text="Run label").grid(row=1, column=0, sticky="w",
+                                              pady=(10, 0))
+        self.v_label = tk.StringVar(value="")
+        ttk.Entry(ctl, textvariable=self.v_label, width=28)\
+            .grid(row=1, column=1, columnspan=3, sticky="w",
+                  padx=(6, 18), pady=(10, 0))
+        ttk.Label(ctl, text="e.g.  T30_HV27.14_hg", style="Sub.TLabel")\
+            .grid(row=1, column=4, columnspan=3, sticky="w", pady=(10, 0))
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        self.btn_start = ttk.Button(bar, text="Start", style="Accent.TButton",
+                                    command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(bar, text="Stop", command=self.stop,
+                                   state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        ttk.Button(bar, text="Clear", command=self.clear).pack(side="left")
+        self.v_log = tk.IntVar(value=0)
+        ttk.Checkbutton(bar, text="log scale", variable=self.v_log,
+                        command=lambda: self.canvas.set_log(self.v_log.get()))\
+            .pack(side="left", padx=16)
+        self.v_raw = tk.IntVar(value=1)
+        ttk.Checkbutton(bar, text="log raw events", variable=self.v_raw)\
+            .pack(side="left")
+        self.light = HealthLight(bar)
+        self.light.pack(side="left", padx=(24, 0))
+        ttk.Button(bar, text="Save plot PNG", command=self.shot_plot)\
+            .pack(side="right", padx=6)
+
+        # Bottom before the plot, so the packer starves the canvas and
+        # not this line - same reasoning as the Measure page, and this
+        # line matters more here: it is where "HG is off" is said.
+        stat = ttk.Frame(self)
+        stat.pack(fill="x", side="bottom")
+        self.lbl = ttk.Label(stat, text="idle", style="Sub.TLabel")
+        self.lbl.pack(side="left")
+
+        self.canvas = HistCanvas(self, height=340)
+        self.canvas.pack(fill="both", expand=True, pady=12)
+
+        self.hist = Histogram(hi=HG_CEIL_CODE, sat_code=HG_SAT_CODE)
+        self.canvas.set_hist(self.hist)
+        self.running = False
+        self.t_start = None
+        self.last_temp = 0.0
+        self._last_ui = 0.0
+        self.raw_fh = None
+        self.raw_writer = None
+        self.raw_path = ""
+        self.raw_rows = 0
+        # Events seen with and without the HG block, this run. Their
+        # ratio is what tells "readout is off" apart from "no source".
+        self.no_hg = 0
+        self.got_hg = 0
+
+    # -- control
+    def start(self):
+        if not self.app.link.connected:
+            messagebox.showwarning("Offline", "Connect to the board first.")
+            return
+        # Same interlock as the Measure page: a spectrum accumulated
+        # across a moving threshold is a sum over settings.
+        if self.app.pages["scan"].running:
+            messagebox.showwarning(
+                "Scan running",
+                "A threshold scan is sweeping DAC1 right now, so this "
+                "run would be taken at a threshold that keeps "
+                "changing.\n\nStop the scan first.")
+            return
+        level, why = self.app.health.summary(True)
+        if level in (LinkHealth.DEAD, LinkHealth.UNSTABLE):
+            if not messagebox.askyesno(
+                    "Link is not healthy",
+                    f"The link reports: {level} - {why}\n\n"
+                    "A run started now may record nothing, or may lose "
+                    "events without saying so.\n\nStart anyway?"):
+                return
+        self.hist.reset(self.v_bins.get(), 0, HG_CEIL_CODE)
+        self.canvas.set_hist(self.hist)
+        self._open_raw()
+        self.running = True
+        self.t_start = time.time()
+        self.no_hg = 0
+        self.got_hg = 0
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+
+    def stop(self):
+        self.running = False
+        self._close_raw()
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+
+    # -- raw event log
+    def _open_raw(self):
+        self._close_raw()
+        self.raw_rows = 0
+        if not self.v_raw.get():
+            self.raw_path = ""
+            return
+        os.makedirs(RAW_DIR, exist_ok=True)
+        label = safe_label(self.v_label.get())
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"raw_hg_{stamp}_{label}.csv" if label else f"raw_hg_{stamp}.csv"
+        self.raw_path = os.path.join(RAW_DIR, name)
+        try:
+            self.raw_fh = open(self.raw_path, "w", newline="", encoding="utf-8")
+        except OSError as exc:
+            self.raw_path = ""
+            messagebox.showwarning(
+                "Raw log not started",
+                f"Could not open the raw file:\n{exc}\n\n"
+                "The histogram still runs, but the per-event data is not "
+                "being kept.")
+            return
+        self.raw_writer = csv.writer(self.raw_fh)
+        # Both gains, always both columns - see the Measure page. The
+        # LG column is not decoration here: it is what an HG run can be
+        # cross-calibrated against afterwards.
+        self.raw_writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg", "hg"])
+
+    def _close_raw(self):
+        if self.raw_fh:
+            try:
+                self.raw_fh.close()
+            except OSError:
+                pass
+        self.raw_fh = None
+        self.raw_writer = None
+
+    def clear(self):
+        self.hist.reset()
+        self.canvas.redraw()
+        self.lbl.configure(text="cleared")
+
+    # -- screenshot
+    def shot_plot(self):
+        self.canvas.clear_tip()
+        self.app.screenshot([self.canvas, self.lbl],
+                            label=self.v_label.get(), kind="spectrum_hg")
+
+    def feed(self, frame):
+        """Called by the app pump for every decoded frame."""
+        if frame["type"] == "status":
+            self.last_temp = frame.get("temp_c", 0.0)
+            return
+        if frame["type"] != "event" or not self.running:
+            return
+
+        hg = frame.get("hg") or ()
+
+        # Raw first, whole window, both gains - the blank-hg rule is
+        # explained at _open_raw.
+        if self.raw_writer:
+            first = frame["first_ch"]
+            temp = f"{frame['temp_c']:.3f}"
+            for i in range(frame["count"]):
+                self.raw_writer.writerow([frame["seq"], frame["t_ms"], temp,
+                                          first + i, frame["lg"][i],
+                                          hg[i] if hg else ""])
+            self.raw_rows += frame["count"]
+
+        # An event without the HG block is an event this page cannot
+        # see, not a measurement of zero. Counted, and said out loud in
+        # _hg_note - never histogrammed.
+        if not hg:
+            self.no_hg += 1
+            return
+        self.got_hg += 1
+
+        ch = self.v_ch.get()
+        idx = ch - frame["first_ch"]
+        if idx < 0 or idx >= frame["count"]:
+            return
+
+        self.hist.add(hg[idx])
+
+    def tick(self):
+        if not self.running:
+            return
+        elapsed = time.time() - self.t_start
+        dur = self.v_dur.get()
+        if dur and elapsed >= dur:
+            raw = os.path.basename(self.raw_path) if self.raw_path else ""
+            note = self._hg_note()
+            self.stop()
+            self.lbl.configure(text=f"finished: {self.hist.total} counts "
+                                    f"in {elapsed:.1f} s"
+                                    + (f" | raw: {raw}" if raw else "")
+                                    + note)
+            self.canvas.redraw()
+            return
+        now = time.time()
+        if now - self._last_ui > 0.25:          # keep redraws cheap
+            self._last_ui = now
+            self.canvas.redraw()
+            if self.raw_fh:
+                try:
+                    self.raw_fh.flush()
+                except OSError:
+                    pass
+            rate = self.hist.total / elapsed if elapsed > 0 else 0
+            pk = self.hist.peak_bin()
+            pk_txt = f"peak ADC {self.hist.centre_of(pk):.0f}" if pk is not None else "-"
+            raw_txt = f" | raw {self.raw_rows} rows" if self.raw_writer else ""
+            self.lbl.configure(
+                text=f"running {elapsed:6.1f} s | {self.hist.total} counts | "
+                     f"{rate:6.1f} cps | {pk_txt} | T {self.last_temp:.1f} C | "
+                     f"saturated {self.hist.saturated}{raw_txt}"
+                     + (self._hg_note() or self._silence_note(elapsed)))
+
+    def _hg_note(self):
+        """Say why the histogram is empty when the reason is 'hg 0'.
+
+        Events arriving without their HG block and no source in front
+        of the crystal look identical on this plot. The frames
+        themselves tell them apart - LG-only events are still events -
+        so this is decided from what arrived, not guessed.
+        """
+        if self.no_hg and not self.got_hg:
+            return ("   <<  events arriving without HG - the readout is "
+                    "off. Type 'hg 1' in the Settings console.")
+        if self.no_hg:
+            # 'hg' was toggled mid-run: part of this spectrum is
+            # missing, and the raw file shows exactly which part.
+            return f"   <<  {self.no_hg} events arrived without HG"
+        return ""
+
+    def _silence_note(self, elapsed):
+        """Same diagnosis as the Measure page: a dead link and a
+        threshold above every pulse make the same empty plot."""
+        level = self.app.health.level(self.app.link.connected)
+        if level in (LinkHealth.DEAD, LinkHealth.OFFLINE):
+            return "   <<  LINK DOWN - these seconds are not being recorded"
+        age = self.app.health.event_age()
+        quiet = (age is None and elapsed > 5.0) or (age is not None and age > 5.0)
+        if quiet:
+            return ("   <<  link ok, no events - threshold, channel enable, "
+                    "or no source")
+        if level == LinkHealth.UNSTABLE:
+            return "   <<  link unstable - counts may be missing"
+        return ""
 
 
 class PageScan(Page):
@@ -3213,9 +3554,10 @@ WHAT EVERY SETTING DOES - GLOBAL
 
     Threshold DACQ charge  (0-1023, default 200)
         Threshold of the charge discriminator, which runs off the high
-        gain chain. HG reaches PA4 but is never read; its
-        discriminator still works, so this matters if selTrig selects
-        the charge trigger. Otherwise it does nothing.
+        gain chain - the same signal 'hg 1' puts on the Measure HG
+        page. The discriminator works whether or not HG is being read
+        out, so this matters if selTrig selects the charge trigger.
+        Otherwise it does nothing.
 
     Hold delay  (0-255) and Slope trim  (0-15)
         Together they set how long after the trigger the peak detector
@@ -3378,18 +3720,22 @@ THRESHOLD SCAN
     python rr2_thscan.py --start 300 --stop 120 --step 20
 
 WHICH SIGNAL IS MEASURED
-    Only OUT_AMUXLG is read out, so every spectrum here is the
-    low gain path: one ADC code per channel per event, and the x axis is
-    raw ADC counts. There is no gain choice to make and nothing to
-    cross-calibrate.
+    OUT_AMUXLG - the low gain path - is what the Measure page reads:
+    one ADC code per channel per event, x axis in raw ADC counts.
 
-    The ASIC still has a high gain chain and the charge trigger is
-    derived from it, but nothing digitises it: its output pad,
-    OUT_AMUXHG, reaches PA4 / ADC1_IN4 but goes unread, and its mux
-    buffer is written off. So
-    it has no controls on the Settings page, and applying a channel
-    leaves its registers exactly as they were. If you ever do need it,
-    the console still takes the second argument:
+    The high gain path is there too, behind one switch. 'hg 1' in the
+    console powers the ASIC's HG mux buffer and makes the readout
+    digitise OUT_AMUXHG on PA4 as well; every event frame then carries
+    a second code per channel, and the Measure HG page histograms it.
+    The board resets with the switch off, and nothing in the GUI flips
+    it for you - a frame that arrives without the HG block shows up on
+    the HG page as exactly that, not as a spectrum of zeros. Expect HG
+    to saturate far below where LG does: same charge, several times
+    the gain, the same 1.32 V buffer ceiling.
+
+    HG still has no controls on the Settings page: Apply channel
+    leaves its registers exactly as they were. To set them, the
+    console takes the second argument:
 
         ch 0 gain 4 6          lgGain 4, hgGain 6
         ch 0 gain 4            lgGain 4, HG untouched
@@ -3719,9 +4065,10 @@ FILES
         selTrig מנתב אותו. בדרך כלל השאר אותו מעל DAC1 והתעלם.
 
     Threshold DACQ charge  (0-1023, ברירת מחדל 200)
-        הסף של דיסקרימינטור המטען, שרץ ממסלול ה-high gain. ה-HG מגיע
-        ל-PA4 אך אינו נקרא, והדיסקרימינטור שלו עדיין עובד, ולכן זה
-        משנה אם selTrig בוחר בטריגר המטען. אחרת הוא לא עושה דבר.
+        הסף של דיסקרימינטור המטען, שרץ ממסלול ה-high gain - אותו
+        אות ש-hg 1 מעלה לעמוד Measure HG. הדיסקרימינטור עובד בין אם
+        ה-HG נקרא ובין אם לא, ולכן זה משנה אם selTrig בוחר בטריגר
+        המטען. אחרת הוא לא עושה דבר.
 
     Hold delay  (0-255)  ו-Slope trim  (0-15)
         יחד הם קובעים כמה זמן אחרי הטריגר נדגם ה-peak detector:
@@ -3866,16 +4213,21 @@ FILES
     python rr2_thscan.py --start 300 --stop 120 --step 20
 
 איזה אות נמדד
-    רק OUT_AMUXLG נקרא, ולכן כל ספקטרום כאן הוא מסלול ה-low
-    gain: קוד ADC אחד לכל ערוץ לכל אירוע, וציר ה-X הוא ספירות ADC
-    גולמיות. אין מה לבחור בין מסלולי הגבר ואין מה לכייל ביניהם.
+    OUT_AMUXLG - מסלול ה-low gain - הוא מה שעמוד Measure קורא:
+    קוד ADC אחד לכל ערוץ לכל אירוע, וציר ה-X הוא ספירות ADC גולמיות.
 
-    ל-ASIC עדיין יש מסלול high gain וטריגר המטען נגזר ממנו, אבל אף
-    אחד לא קורא אותו: פד היציאה שלו, OUT_AMUXHG, מגיע ל-PA4 / ADC1_IN4
-    אך אינו נקרא, והמאגר שלו נכתב כבוי. לכן אין לו פקדים בעמוד
-    Settings, ו-Apply channel
-    משאיר את הרגיסטרים שלו בדיוק כפי שהיו. אם בכל זאת תצטרך אותו,
-    הקונסולה עדיין מקבלת ארגומנט שני:
+    גם מסלול ה-high gain קיים, מאחורי מתג אחד. הפקודה hg 1 בקונסולה
+    מפעילה את מאגר ה-mux של ה-HG בתוך ה-ASIC וגורמת לקריאה לדגום גם
+    את OUT_AMUXHG על PA4; מאותו רגע כל מסגרת אירוע נושאת קוד שני לכל
+    ערוץ, ועמוד Measure HG בונה ממנו את ההיסטוגרמה. הלוח מתאתחל עם
+    המתג כבוי, ושום דבר ב-GUI לא מדליק אותו בשבילך - מסגרת שהגיעה
+    בלי בלוק ה-HG מוצגת בעמוד ה-HG בדיוק ככזאת, לא כספקטרום של
+    אפסים. צפה שה-HG ירווה הרבה מתחת לנקודה שבה ה-LG רווה: אותו
+    מטען, הגבר גדול פי כמה, אותה תקרת מאגר של 1.32 וולט.
+
+    ל-HG עדיין אין פקדים בעמוד Settings: לחיצה על Apply channel משאירה את
+    הרגיסטרים שלו בדיוק כפי שהיו. כדי לקבוע אותם, הקונסולה מקבלת
+    ארגומנט שני:
 
         ch 0 gain 4 6          lgGain 4, hgGain 6
         ch 0 gain 4            lgGain 4, ה-HG לא נגע
@@ -4244,7 +4596,8 @@ class App(tk.Tk):
 
         self.pages = {}
         for key, cls in (("main", PageMain), ("settings", PageSettings),
-                         ("measure", PageMeasure), ("scan", PageScan),
+                         ("measure", PageMeasure), ("hg", PageHG),
+                         ("scan", PageScan),
                          ("history", PageHistory), ("help", PageHelp)):
             pg = cls(container, self)
             pg.grid(row=0, column=0, sticky="nsew")
@@ -4368,6 +4721,7 @@ class App(tk.Tk):
             self.health.on_frame(frame)
             self.show_cmd_verdict(self.cmdwatch.on_frame(frame))
             self.pages["measure"].feed(frame)
+            self.pages["hg"].feed(frame)
             self.pages["scan"].feed(frame)
 
         while True:
@@ -4390,6 +4744,7 @@ class App(tk.Tk):
             self.show_cmd_verdict(self.cmdwatch.poll())
 
         self.pages["measure"].tick()
+        self.pages["hg"].tick()
         self.pages["scan"].tick()
         self.after(40, self.pump)
 
@@ -4430,6 +4785,7 @@ class App(tk.Tk):
         self.health_bar.update_health(level, why)
         self.pages["main"].light.update_health(level, why)
         self.pages["measure"].light.update_health(level, why)
+        self.pages["hg"].light.update_health(level, why)
         self.pages["scan"].light.update_health(level, why)
 
     def stop_scan_for_shutdown(self, what):
