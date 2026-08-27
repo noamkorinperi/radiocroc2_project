@@ -6,6 +6,7 @@
  ******************************************************************************
  */
 #include "radioroc2_daq.h"
+#include "radioroc2_ctrl.h"  /* the shadow, to read back the hold delay */
 #include "main.h"     /* pin macros generated from the CubeMX User Labels */
 #include <stddef.h>
 
@@ -13,7 +14,15 @@
 /* Module state                                                        */
 /* ------------------------------------------------------------------ */
 static ADC_HandleTypeDef *rr2_adc_lg = NULL;   /* OUT_AMUXLG -> PA5 */
+static ADC_HandleTypeDef *rr2_adc_hg = NULL;   /* OUT_AMUXHG -> PA4 */
 static uint32_t rr2_seq = 0u;
+
+/* HG readout switch, flipped by the 'hg' host command. Kept here and
+   not derived from the OUT_POWER shadow on purpose: the shadow says
+   what the ASIC was asked to power, this says what the DAQ samples,
+   and after a failed Slow Control write the two can disagree - the
+   'glob' dump shows both so that disagreement is visible.             */
+static uint8_t rr2_hg_on = 0u;
 
 /* Per-conversion timeout. One conversion at 144+15 cycles / 27 MHz is
    about 5.9 us, so 2 ms is a very generous ceiling.                   */
@@ -107,9 +116,28 @@ void RR2_DAQ_EndOfReadout(void)
     HAL_GPIO_WritePin(RESET_N_GPIO_Port, RESET_N_Pin, GPIO_PIN_SET);
 }
 
+uint32_t RR2_DAQ_HoldDelayNs(void)
+{
+    const RR2_Shadow *s = RR2_Ctrl_GetShadow();
+
+    /* delay * 0.85 ns * slopeTrim. The 85/100 keeps this in integers:
+       the DAQ path has no business pulling in soft float.             */
+    const uint32_t delay = (uint32_t)s->com_delay;                      /* 0..255 */
+    const uint32_t slope = (uint32_t)RR2_GET(RR2_SLOPETRIM, s->com_slope); /* 0..15 */
+
+    uint32_t ns = ((delay * slope * 85u) + 99u) / 100u;   /* round up */
+
+    if (ns < RR2_HOLD_DELAY_MIN_NS) ns = RR2_HOLD_DELAY_MIN_NS;
+
+    /* The datasheet figure is nominal and the delay cell has spread, so
+       wait half as long again plus a fixed pad. Overshooting only costs
+       dead time - the peak detectors hold until RESET_N either way.   */
+    return ns + (ns / 2u) + RR2_HOLD_DELAY_PAD_NS;
+}
+
 void RR2_DAQ_WaitHold(void)
 {
-    RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_HOLD_DELAY_NS));
+    RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_DAQ_HoldDelayNs()));
 }
 
 /* ------------------------------------------------------------------ */
@@ -133,18 +161,72 @@ RR2_Status RR2_DAQ_SampleLG(uint16_t *lg)
     return RR2_OK;
 }
 
+RR2_Status RR2_DAQ_SamplePair(uint16_t *lg, uint16_t *hg)
+{
+    if ((lg == NULL) || (hg == NULL))                 return RR2_ERR_DATA;
+    if ((rr2_adc_lg == NULL) || (rr2_adc_hg == NULL)) return RR2_ERR_ADC;
+
+    /* LG and HG sit on SEPARATE converters, so both are started before
+       either is polled and the two ~6 us conversions overlap. Chaining
+       two SampleLG-style start/poll/stop pairs here instead puts ~48 us
+       of conversions into every 4-channel event where ~24 us does - the
+       ADC, not CK_READ, is this readout's bottleneck (see the timing
+       note in the header), and that halves the event rate for nothing
+       in return.                                                      */
+    if (HAL_ADC_Start(rr2_adc_lg) != HAL_OK) return RR2_ERR_ADC;
+    if (HAL_ADC_Start(rr2_adc_hg) != HAL_OK) {
+        HAL_ADC_Stop(rr2_adc_lg);
+        return RR2_ERR_ADC;
+    }
+
+    RR2_Status st = RR2_OK;
+
+    if (HAL_ADC_PollForConversion(rr2_adc_lg, RR2_ADC_TIMEOUT_MS) == HAL_OK) {
+        *lg = (uint16_t)HAL_ADC_GetValue(rr2_adc_lg);
+    } else {
+        st = RR2_ERR_ADC;
+    }
+
+    /* HG is polled even after an LG failure: both converters must end
+       this call stopped, or the next event starts on a running ADC and
+       every sample from then on is one conversion stale.              */
+    if (HAL_ADC_PollForConversion(rr2_adc_hg, RR2_ADC_TIMEOUT_MS) == HAL_OK) {
+        *hg = (uint16_t)HAL_ADC_GetValue(rr2_adc_hg);
+    } else {
+        st = RR2_ERR_ADC;
+    }
+
+    HAL_ADC_Stop(rr2_adc_lg);
+    HAL_ADC_Stop(rr2_adc_hg);
+    return st;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public entry points                                                 */
 /* ------------------------------------------------------------------ */
-void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg)
+void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg, ADC_HandleTypeDef *adc_hg)
 {
     rr2_adc_lg = adc_lg;
+    rr2_adc_hg = adc_hg;
+    rr2_hg_on  = 0u;      /* HG is opt-in, from the 'hg' host command */
     rr2_seq    = 0u;
     RR2_DWT_Enable();
 
     /* Park the readout lines in their idle state. */
     HAL_GPIO_WritePin(CK_READ_GPIO_Port,   CK_READ_Pin,   GPIO_PIN_RESET);
     HAL_GPIO_WritePin(RSTN_READ_GPIO_Port, RSTN_READ_Pin, GPIO_PIN_SET);
+}
+
+RR2_Status RR2_DAQ_SetHG(uint8_t on)
+{
+    if (on && (rr2_adc_hg == NULL)) return RR2_ERR_ADC;
+    rr2_hg_on = on ? 1u : 0u;
+    return RR2_OK;
+}
+
+uint8_t RR2_DAQ_GetHG(void)
+{
+    return rr2_hg_on;
 }
 
 RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count)
@@ -158,6 +240,14 @@ RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count)
     evt->first_ch = first_ch;
     evt->count    = count;
     evt->seq      = ++rr2_seq;
+
+    /* Latched once per event, not read per channel. The 'hg' command is
+       serviced from the same main loop between events, so mid-event it
+       cannot actually flip - but the stream decides the payload length
+       from this field, and deriving it twice invites the one bug a
+       length-tagged format cannot survive: a length that disagrees
+       with the data behind it.                                        */
+    evt->has_hg   = rr2_hg_on;
 
     RR2_DAQ_ResetReadPointer();
 
@@ -174,7 +264,9 @@ RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count)
         RR2_DAQ_ClockOnce();                                  /* select ch */
         RR2_DelayCycles(RR2_NS_TO_CYCLES(RR2_MUX_SETTLE_NS)); /* let it settle */
 
-        RR2_Status st = RR2_DAQ_SampleLG(&evt->lg[ch]);
+        RR2_Status st = evt->has_hg
+            ? RR2_DAQ_SamplePair(&evt->lg[ch], &evt->hg[ch])
+            : RR2_DAQ_SampleLG(&evt->lg[ch]);
         if (st != RR2_OK) {
             RR2_DAQ_EndOfReadout();   /* always re-arm the ASIC */
             return st;

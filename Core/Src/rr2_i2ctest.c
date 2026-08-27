@@ -142,7 +142,7 @@ static uint32_t clk_sm_hz(void)
 /**
  * @brief Retune CLK_SM_I2C without stopping it.
  *
- * ARR and CCR1 are both preloaded (CubeMX enables auto-reload preload),
+ * ARR and CCR2 are both preloaded (CubeMX enables auto-reload preload),
  * so writing them alone would leave the old values in the shadow
  * registers until the next update event. Forcing UG transfers them
  * immediately and restarts the period cleanly.
@@ -150,7 +150,7 @@ static uint32_t clk_sm_hz(void)
 static void clk_set_arr(uint32_t arr)
 {
     __HAL_TIM_SET_AUTORELOAD(&htim1, arr);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (arr + 1u) / 2u);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (arr + 1u) / 2u);
 
     TIM1->EGR = TIM_EGR_UG;
 }

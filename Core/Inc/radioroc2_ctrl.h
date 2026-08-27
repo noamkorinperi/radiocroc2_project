@@ -91,8 +91,9 @@ const RR2_Shadow *RR2_Ctrl_GetShadow(void);
 RR2_Status RR2_Ctrl_SetInDac(uint8_t ch, uint8_t value);
 
 /** Charge preamp gains. lg 0..15 (span 0.5-8), hg 0..15 (span 5-80).
- *  Only the LG path is digitised - see the note on SetAnalogMux - so hg
- *  is kept for the charge trigger, which still runs off the HG chain.
+ *  hg matters even with the HG readout off: the charge trigger runs
+ *  off the HG chain regardless. With 'hg 1' it also scales the codes
+ *  the second ADC digitises.
  *  Pass RR2_KEEP for either half to leave it exactly as it is.       */
 RR2_Status RR2_Ctrl_SetChargeGain(uint8_t ch, uint8_t lg, uint8_t hg);
 
@@ -116,6 +117,17 @@ RR2_Status RR2_Ctrl_SetThresholdTrim(uint8_t ch, uint8_t trim1, uint8_t trim2);
  *  shapers and peak detectors together. Disable unused channels so
  *  they stop contributing to the NOR triggers.                       */
 RR2_Status RR2_Ctrl_SetChannelEnabled(uint8_t ch, uint8_t enable);
+
+/** The three discriminators of a channel, without touching anything
+ *  else it does. A channel with them off still shapes its input and
+ *  still presents a peak-detector code to the readout - it simply
+ *  cannot fire the NOR trigger.
+ *
+ *  That is what a baseline reference channel wants: an unconnected
+ *  input is floating, and a spurious hit there raises the same trigger
+ *  as a real gamma, which looks exactly like a detector that ignores
+ *  its source.                                                       */
+RR2_Status RR2_Ctrl_SetDiscriminators(uint8_t ch, uint8_t enable);
 
 /** Internal charge injection, for exercising the analog chain with no
  *  radiation source. use_ctest selects the 1.5 pF test capacitor.    */
@@ -144,10 +156,18 @@ RR2_Status RR2_Ctrl_SetHoldExternal(uint8_t external);
 /** Power the LG analog multiplexer buffer. It must be on or the ADC
  *  reads nothing from OUT_AMUXLG.
  *
- *  There is no HG argument on purpose: OUT_AMUXHG goes nowhere on this
- *  board, so its buffer is always written off. The HG chain inside the
- *  ASIC stays powered - the charge trigger is derived from it.       */
+ *  LG only: the HG buffer has its own switch below and is deliberately
+ *  not touched here, so enabling one gain path can never silently
+ *  unpower the other.                                                */
 RR2_Status RR2_Ctrl_SetAnalogMux(uint8_t enable);
+
+/** Power the HG analog multiplexer buffer, OUT_AMUXHG -> PA4 / ADC1_IN4.
+ *  This is the ASIC half of the 'hg' command; the DAQ half, which
+ *  digitises the pin and appends the codes to the stream, is
+ *  RR2_DAQ_SetHG(). Off by default. The HG chain inside the ASIC stays
+ *  powered either way - the charge trigger is derived from it - this
+ *  only switches whether its peaks reach the pin.                    */
+RR2_Status RR2_Ctrl_SetAnalogMuxHG(uint8_t enable);
 
 /* ------------------------------------------------------------------ */
 /* Convenience preset                                                  */

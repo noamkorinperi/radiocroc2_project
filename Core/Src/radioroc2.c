@@ -38,6 +38,76 @@ void RR2_Init(I2C_HandleTypeDef *hi2c)
     rr2_i2c = hi2c;
 }
 
+/**
+ * @brief Free a bus that a slave is still holding, and say whether it was.
+ *
+ * A reset landing in the middle of a Slow Control frame resets the
+ * STM32 and nothing else. The ASIC is left part way through clocking a
+ * byte out, holding SDA low and waiting on SCL edges the restarted
+ * firmware never sends. From then on no START is valid and every
+ * transaction fails - which presents as a chip that still ACKs its ID
+ * and refuses every write, with i2ctest reporting SDA_STUCK_LOW.
+ * Nothing in software cleared it, so the only cure was to pull power,
+ * which on a board wired into a temperature soak is not a small ask.
+ *
+ * The way out is to drive SCL by hand: every falling edge advances the
+ * slave one bit, and within nine it reaches a bit it does not drive and
+ * lets go. A hand-made STOP afterwards leaves it at idle rather than
+ * stranded mid-transfer.
+ *
+ * Costs nothing when the bus is already idle, and is safe with no ASIC
+ * on the other end. Clocked from HAL_Delay, so about 500 Hz - unjamming
+ * has no minimum speed, and this needs no calibrated timer.
+ */
+uint8_t RR2_I2C_BusRecover(void)
+{
+    GPIO_InitTypeDef g = {0};
+    uint8_t freed;
+
+    if (rr2_i2c == NULL) return 0u;
+
+    /* Idle already. Do not touch a working bus. */
+    if ((GPIOB->IDR & GPIO_PIN_9) != 0u) return 1u;
+
+    /* Take the pads off the peripheral and drive them the way I2C does:
+       open drain, no internal pull, the board's own pull-ups making the
+       high level. */
+    (void)HAL_I2C_DeInit(rr2_i2c);
+
+    g.Pin   = GPIO_PIN_8 | GPIO_PIN_9;
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(1u);
+
+    for (uint8_t i = 0u; i < 9u; ++i) {
+        if ((GPIOB->IDR & GPIO_PIN_9) != 0u) break;   /* let go already */
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+        HAL_Delay(1u);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+        HAL_Delay(1u);
+    }
+    freed = ((GPIOB->IDR & GPIO_PIN_9) != 0u) ? 1u : 0u;
+
+    /* STOP by hand - SDA released while SCL is high. Without it the
+       slave is free but still inside a transfer, and the next START
+       would read as a repeated one. */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+    HAL_Delay(1u);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    HAL_Delay(1u);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(1u);
+
+    /* Hand the pads back. DeInit left the handle in RESET, so this runs
+       HAL_I2C_MspInit() again and the pins return to AF4. */
+    (void)HAL_I2C_Init(rr2_i2c);
+
+    return freed;
+}
+
 HAL_StatusTypeDef RR2_IsReady(uint32_t trials)
 {
     /* Probe R0's address. The ASIC ACKs when CHIP_ID matches, which

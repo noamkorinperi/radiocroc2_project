@@ -1,0 +1,18 @@
+# RADIOROC2 host tools - Python dependencies
+#
+#   pip install -r requirements.txt
+#
+# Python 3.8 or newer (rr2_gui.py uses the walrus operator), with tkinter.
+# tkinter ships with the python.org Windows installer; on Debian/Ubuntu it is
+# a separate package, apt install python3-tk.
+
+# Required. The serial link to the board - without it nothing connects.
+pyserial>=3.5
+
+# Optional. Excel export on the History page; without it the export falls
+# back to CSV and everything else behaves normally.
+openpyxl>=3.1
+
+# Optional. F12 screenshots; without it the button says so and the rest of
+# the application is unaffected.
+pillow>=10.0

@@ -24,9 +24,13 @@ Event payload:
     12  1   first channel
     13  1   channel count
     14  2*count  OUT_AMUXLG codes, one per channel
+    then, only while the firmware's HG readout is on ('hg 1'):
+    ..  2*count  OUT_AMUXHG codes, same channel order
 
-Only OUT_AMUXLG is wired to an ADC on the board, so an event carries one
-code per channel, not one per gain path.
+There is no flag byte for the HG block - the length is the flag:
+plen >= 14 + 4*count means both gains are present. Same append-only
+trick the status frame plays with its command counters, so captures
+from LG-only firmware replay through this decoder unchanged.
 
 The command interface shares this one UART and its replies are plain
 text with no framing, so they show up as gaps between frames. Decoder
@@ -93,11 +97,12 @@ def describe_ports():
 FRAME_EVENT = 1
 FRAME_STATUS = 2
 
-# Longest payload the firmware can emit: a 64-channel event is 14 header
-# bytes plus 2 per channel. Status frames are 27. plen is a uint16, so a
-# false sync can claim up to 65535 - bounding it here is what stops the
-# parser stalling on two bytes of data that happened to read A5 5A.
-MAX_PAYLOAD = 14 + 2 * 64          # 142
+# Longest payload the firmware can emit: a 64-channel event with the HG
+# readout on is 14 header bytes plus 4 per channel. Status frames are 30.
+# plen is a uint16, so a false sync can claim up to 65535 - bounding it
+# here is what stops the parser stalling on two bytes of data that
+# happened to read A5 5A.
+MAX_PAYLOAD = 14 + 4 * 64          # 270
 
 # Cap on the recovered-text buffer. A link that is pure noise must not be
 # able to grow it without bound.
@@ -232,6 +237,13 @@ class Decoder:
         if ftype == FRAME_EVENT:
             seq, ts, temp, first, count = struct.unpack_from("<IIiBB", p, 0)
             lg = list(struct.unpack_from(f"<{count}H", p, 14))
+            # The HG block announces itself by length alone - no flag
+            # byte, mirroring the status frame's appended counters. An
+            # LG-only event, from this firmware with 'hg 0' or from any
+            # firmware before the block existed, takes the empty branch.
+            hg = []
+            if len(p) >= 14 + 4 * count:
+                hg = list(struct.unpack_from(f"<{count}H", p, 14 + 2 * count))
             return {
                 "type": "event",
                 "seq": seq,
@@ -240,12 +252,13 @@ class Decoder:
                 "first_ch": first,
                 "count": count,
                 "lg": lg,
+                "hg": hg,
             }
 
         if ftype == FRAME_STATUS:
             (uptime, trig, ok, bad, drop, temp,
              flags, cfg_st, rd_st) = struct.unpack_from("<IIIIIiBBB", p, 0)
-            return {
+            out = {
                 "type": "status",
                 "uptime_ms": uptime,
                 "triggers": trig,
@@ -256,9 +269,26 @@ class Decoder:
                 "rr2_online": bool(flags & 0x01),
                 "temp_online": bool(flags & 0x02),
                 "timing_ok": bool(flags & 0x04),
+                # SDA was found held low at boot and clocked free.
+                # A boot-time event, not a running condition.
+                "bus_jam": bool(flags & 0x08),
                 "cfg_status": cfg_st,
                 "read_status": rd_st,
             }
+
+            # Command result counters, appended after the original 27
+            # bytes. A reply to a typed command is unframed text and can
+            # be lost, which reads exactly like a command that never
+            # ran; these ride inside the CRC and are resent every
+            # second, so the host can confirm a batch by watching the
+            # completed count move. Read conditionally, because firmware
+            # built before they existed still sends the shorter frame.
+            if len(p) >= 30:
+                done, failed, last = struct.unpack_from("<BBB", p, 27)
+                out["cmd_done"] = done
+                out["cmd_failed"] = failed
+                out["cmd_last"] = last
+            return out
 
         return {"type": "unknown", "ftype": ftype, "raw": p}
 
@@ -305,18 +335,24 @@ def main():
     if args.csv:
         csv_fh = open(args.csv, "w", newline="")
         writer = csv.writer(csv_fh)
-        writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg"])
+        writer.writerow(["seq", "t_ms", "temp_c", "ch", "lg", "hg"])
 
     def handle(frame):
         if frame["type"] == "event":
             peak = max(frame["lg"]) if frame["lg"] else 0
+            hg = frame["hg"]
+            hg_note = f" maxHG={max(hg)}" if hg else ""
             print(f"EVT seq={frame['seq']:<6} t={frame['t_ms']/1000:8.3f}s "
                   f"T={frame['temp_c']:6.2f}C ch={frame['first_ch']}+{frame['count']} "
-                  f"maxLG={peak}")
+                  f"maxLG={peak}{hg_note}")
             if writer:
+                # The hg column stays present but empty for LG-only
+                # events, so one capture that toggled 'hg' mid-run still
+                # loads as a single consistent table.
                 for i in range(frame["count"]):
                     writer.writerow([frame["seq"], frame["t_ms"], frame["temp_c"],
-                                     frame["first_ch"] + i, frame["lg"][i]])
+                                     frame["first_ch"] + i, frame["lg"][i],
+                                     hg[i] if hg else ""])
         elif frame["type"] == "status":
             print(f"STA up={frame['uptime_ms']/1000:.1f}s trig={frame['triggers']} "
                   f"ok={frame['events_ok']} bad={frame['events_bad']} "

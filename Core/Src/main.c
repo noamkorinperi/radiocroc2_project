@@ -32,7 +32,6 @@
 #include "usb_stream.h"      /* event streaming over the ST-Link VCP */
 #include "radioroc2_ctrl.h"  /* shadow registers + setters */
 #include "usb_cmd.h"         /* host command interface */
-#include "rr2_test_clocks.h" /* scope test 1: CLK_SM_I2C + CK_READ */
 #include "rr2_test_i2c.h"    /* scope test 2: Slow Control I2C bus */
 #include <stdio.h>           /* optional: printf over SWO/VCP */
 /* USER CODE END Includes */
@@ -44,7 +43,33 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ---- Experiment window ------------------------------------------
+ * Which channels the readout digitises, and which ones the ASIC is
+ * configured for at boot. Everything outside this window is disabled,
+ * so 60 unconnected inputs stop feeding the NOR trigger.
+ *
+ * The window is deliberately WIDER than the one instrumented channel.
+ * Only RR2_EXP_SIGNAL_CH carries a SiPM; the channels after it are
+ * dark, and their peak-detector codes in the same event are a live
+ * sample of the readout chain's own baseline - trigger, temperature
+ * and all. That is the pedestal, recorded next to every measurement
+ * instead of once in a separate run, which is what lets a thermal
+ * sweep be pedestal-corrected afterwards from its own data.
+ *
+ * The trigger that latched the event came from the signal channel, so
+ * it is uncorrelated with the noise in these three - no selection bias,
+ * unlike a pedestal harvested by lowering the threshold into the noise.
+ * ------------------------------------------------------------------ */
+#define RR2_EXP_SIGNAL_CH   0u   /* the channel with the SiPM on it    */
+#define RR2_EXP_FIRST_CH    0u   /* first channel read out             */
+#define RR2_EXP_NUM_CH      4u   /* signal + 3 dark baseline references */
 
+/* Widening the array later means moving two of these three, and the one
+   left behind is silent: the signal channel simply stops being read and
+   the stream fills with baseline. Make the compiler notice instead.  */
+_Static_assert((RR2_EXP_SIGNAL_CH >= RR2_EXP_FIRST_CH) &&
+               (RR2_EXP_SIGNAL_CH <  RR2_EXP_FIRST_CH + RR2_EXP_NUM_CH),
+               "signal channel sits outside the readout window");
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -70,6 +95,10 @@ volatile uint8_t  g_rr2_sc_error = 0;
    debugger: RR2_OK (0) means the ASIC accepted the full config.    */
 volatile RR2_Status g_rr2_cfg_status = RR2_OK;
 volatile uint8_t    g_rr2_online     = 0;   /* 1 = ASIC ACKed */
+/* 1 = SDA was found held low at boot and had to be clocked free. Worth
+   surfacing: it means something reset mid-frame, and the ASIC spent the
+   time since refusing every write. */
+volatile uint8_t    g_rr2_bus_jam    = 0;
 
 /* Most recent digitised event (~136 bytes, lives in .bss).         */
 RR2_Event g_rr2_event;
@@ -98,6 +127,7 @@ static void MPU_Config(void);
 static void RR2_HW_ReleaseResets(void);
 static void RR2_StartClocks(void);
 static uint8_t RR2_Bringup(void);
+static RR2_Status RR2_ApplyExperimentConfig(void);
 static void RR2_ServiceEvent(void);
 static void TMP_Poll(void);
 static void USB_SendStatusPeriodic(void);
@@ -189,12 +219,35 @@ int main(void)
      *   2) Only then release the resets.
      *   3) Only then talk to the chip.
      * ------------------------------------------------------------- */
+    /* Deafen the trigger until the ASIC is configured.
+     *
+     * MX_GPIO_Init() arms EXTI0 about a second before the chip is in a
+     * state worth listening to. For that second all 64 channels are
+     * enabled - 60 of them on floating inputs - and RR2_Ctrl_PushAll()
+     * is busy writing a shadow whose threshold DACs are still 0x00,
+     * which is the very bottom of the 256..534 mV range. Every
+     * discriminator fires on everything, and the counter reaches the
+     * hundreds before the run has begun.
+     *
+     * Those counts are not harmless. trigger_count is what a rate
+     * measurement is read from, and starting it at some arbitrary
+     * boot-dependent offset makes the first reading of a quiet
+     * detector indistinguishable from a working one. The single event
+     * serviced immediately afterwards is worse: it is a real frame,
+     * with a sequence number and a timestamp, carrying peak detector
+     * codes from a chip that was still being configured while they
+     * were captured. */
+    HAL_NVIC_DisableIRQ(NOR_T1OC_EXTI_IRQn);
+
     RR2_StartClocks();                    /* CLK_SM_I2C = 2 MHz           */
     RR2_HW_ReleaseResets();               /* de-assert active-low resets  */
     RR2_Init(&hi2c1);                     /* bind the Slow Control driver */
-    /* Only OUT_AMUXLG is instrumented, on PA5 / ADC2_IN5. ADC1 (PA4) is
-       still brought up by CubeMX above, but nothing reads it. */
-    RR2_DAQ_Init(&hadc2);                 /* bind the ADC, enable DWT     */
+    /* Both gains reach an ADC since the rewire - OUT_AMUXLG on PA5 /
+       ADC2_IN5, OUT_AMUXHG on PA4 / ADC1_IN4. Both handles are bound,
+       but HG stays dormant until the host sends 'hg 1': the switch
+       lives in the DAQ and the OUT_POWER shadow, not in which handles
+       this call was given. */
+    RR2_DAQ_Init(&hadc2, &hadc1);         /* bind the ADCs, enable DWT    */
     g_rr2_timing_ok = RR2_DAQ_IsTimingOk();
 
     /* Temperature sensor lives on its own bus, independent of the ASIC. */
@@ -205,16 +258,15 @@ int main(void)
      * answered, otherwise a later 'push' from the host would write
      * zeros everywhere. */
     RR2_Ctrl_ResetShadow();
-    /* Scan all 16 possible chip IDs to find which one ACKs. */
-    volatile uint8_t found_id = 0xFF;
-    for (uint8_t id = 0; id < 16; id++) {
-        uint8_t addr = (uint8_t)(((id << 3) | 0) << 1);   /* R0 of that chip id */
-        if (HAL_I2C_IsDeviceReady(&hi2c1, addr, 3, 100) == HAL_OK) {
-            found_id = id;
-            break;
-        }
+
+    /* Free the bus before the first transaction. A reset that landed
+       inside a Slow Control frame leaves the ASIC holding SDA low, and
+       every write from here would fail until someone pulled power. */
+    if ((GPIOB->IDR & GPIO_PIN_9) == 0u) {
+        g_rr2_bus_jam = 1u;
+        (void)RR2_I2C_BusRecover();
     }
-    /* breakpoint here, read found_id */
+
     g_rr2_online = RR2_Bringup();
 
     if (g_rr2_online) {
@@ -223,8 +275,24 @@ int main(void)
         if (g_rr2_cfg_status == RR2_OK) {
             g_rr2_cfg_status = RR2_Ctrl_SetThresholds(300u, 500u, 200u);
         }
+        if (g_rr2_cfg_status == RR2_OK) {
+            g_rr2_cfg_status = RR2_ApplyExperimentConfig();
+        }
         RR2_DAQ_EndOfReadout();
     }
+
+    /* Now the trigger means something. Re-armed outside the branch
+       above so an ASIC that never answered still ends up in a defined
+       state rather than permanently deaf. The pending bit is cleared
+       as well as the flag: the edges that arrived while the interrupt
+       was masked are latched in the EXTI, and enabling the IRQ without
+       dropping them would deliver the whole boot burst as one trigger
+       the moment the main loop starts. */
+    g_rr2_trigger_flag  = 0u;
+    g_rr2_trigger_count = 0u;
+    __HAL_GPIO_EXTI_CLEAR_IT(NOR_T1OC_Pin);
+    HAL_NVIC_ClearPendingIRQ(NOR_T1OC_EXTI_IRQn);
+    HAL_NVIC_EnableIRQ(NOR_T1OC_EXTI_IRQn);
 
     /* Start the host link. Binary framing by default; switch to
      * USBSTREAM_FMT_TEXT if you want to watch it in a serial terminal. */
@@ -246,12 +314,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
     while (1)
       {
-        /* --- Scope tests, driven from the debugger -------------------- */
-        /* Both are no-ops until their mode variable is set from Live
-           Expressions, and both block until it is cleared again. Keep
-           them ahead of the DAQ so nothing else drives the lines while
-           a probe is on them. See rr2_test_clocks.h / rr2_test_i2c.h. */
-        RR2_TestClocks_Task();
+        /* --- Scope test, driven from the debugger --------------------- */
+        /* A no-op until its mode variable is set from Live Expressions,
+           and it blocks until that is cleared again. Kept ahead of the
+           DAQ so nothing else drives the bus while a probe is on it.
+           See rr2_test_i2c.h. */
         RR2_TestI2C_Task();
 
         /* --- Slow Control error reported by the ASIC ------------------ */
@@ -344,7 +411,7 @@ void SystemClock_Config(void)
 /**
  * @brief Start the clock the ASIC's I2C slave core needs.
  *
- * CLK_SM_I2C (PE9 / TIM1_CH1) MUST run at exactly 20x the SCL
+ * CLK_SM_I2C (PA9 / TIM1_CH2) MUST run at exactly 20x the SCL
  * frequency: 100 kHz SCL -> 2 MHz here.
  *
  * CK_READ is deliberately NOT started here. It is burst generated in
@@ -352,7 +419,7 @@ void SystemClock_Config(void)
  */
 static void RR2_StartClocks(void)
 {
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);   /* CLK_SM_I2C, 2 MHz */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);   /* CLK_SM_I2C, 2 MHz */
 }
 
 /**
@@ -390,21 +457,87 @@ static uint8_t RR2_Bringup(void)
 }
 
 /**
+ * @brief Put the ASIC into the configuration the experiment runs in.
+ *
+ * Applied at boot rather than left to the operator, because the Slow
+ * Control is volatile: a brown-out during a temperature soak otherwise
+ * brings the chip back with 64 live channels on 20 ns shaping, and it
+ * keeps streaming, and it looks exactly like data. Only uptime_ms going
+ * backwards in the status frame gives it away.
+ *
+ * inDac is pinned mid-scale. The sweep itself moves the HV supply, not
+ * this DAC - its whole span is 550 mV, about 25 C of drift, which is
+ * not enough to cover the range. What mid-scale buys is a trim that
+ * still works in both directions afterwards, roughly +-275 mV, and it
+ * keeps the sensor 276 mV further from the overvoltage where the low
+ * gain chain runs out of ceiling.
+ *
+ * The value equals RR2_CH_INDAC_DEFAULT, so this write changes nothing
+ * the shadow reset had not already done. It is here so the choice is
+ * stated where the experiment is configured, rather than inherited from
+ * a constant whose job is to mean "what the datasheet powers up as".
+ */
+static RR2_Status RR2_ApplyExperimentConfig(void)
+{
+    RR2_Status st;
+
+    /* Silence every channel, then bring back only the window. The 60
+       unconnected inputs are floating, and their discriminators feed
+       the same NOR trigger as the channel that matters.              */
+    st = RR2_Ctrl_SetChannelEnabled(RR2_CH_ALL, 0u);
+    if (st != RR2_OK) return st;
+
+    for (uint8_t c = RR2_EXP_FIRST_CH;
+         c < (uint8_t)(RR2_EXP_FIRST_CH + RR2_EXP_NUM_CH); ++c) {
+        st = RR2_Ctrl_SetChannelEnabled(c, 1u);
+        if (st != RR2_OK) return st;
+
+        /* Everything in the window except the signal channel is there
+           to report a baseline, not to trigger. Their inputs are
+           unconnected and floating, and a spurious discriminator hit
+           raises the same NOR trigger as a real gamma - which presents
+           as a count rate that ignores the source, the one symptom
+           first light is looking for. Shapers and peak detectors stay
+           on; only the discriminators go. */
+        if (c != RR2_EXP_SIGNAL_CH) {
+            st = RR2_Ctrl_SetDiscriminators(c, 0u);
+            if (st != RR2_OK) return st;
+        }
+    }
+
+    /* Every channel, not just the window: the dark references are
+       supposed to report the same front end the signal channel runs
+       on, and an input DAC left elsewhere would offset their baseline
+       against it.                                                    */
+    st = RR2_Ctrl_SetInDac(RR2_CH_ALL, 128u);
+    if (st != RR2_OK) return st;
+
+    /* Slow shaping, ~1.7 us peaking, hold delay stretched to match.
+       Safe to run after the channel gating: the shaping setters touch
+       only their own bits and leave the enables alone.               */
+    return RR2_Ctrl_PresetCsI();
+}
+
+/**
  * @brief Digitise one event after a trigger.
  *
  * The ASIC's delay cell has to finish asserting "hold" before the read
- * register may be clocked, so wait that out first. A full 64-channel
- * readout takes roughly 64 x 6 us = 400 us, dominated by the ADC.
+ * register may be clocked, so wait that out first - for however long
+ * the currently configured delay needs, which RR2_DAQ_WaitHold() works
+ * out from the shadow.
  *
- * If only a few channels are instrumented, replace RR2_DAQ_ReadEvent
- * with RR2_DAQ_ReadWindow(&g_rr2_event, first_ch, count) - it fast
- * forwards past the unused channels and is far quicker.
+ * Only the experiment window is digitised. All 64 channels would cost
+ * roughly 64 x 6 us = 400 us of dead time and 149 bytes on the wire per
+ * event, against 25 us and 29 bytes for four - and the 60 channels left
+ * out are disabled anyway, so their codes would carry nothing.
  */
 static void RR2_ServiceEvent(void)
 {
     RR2_DAQ_WaitHold();
 
-    g_rr2_read_status = RR2_DAQ_ReadEvent(&g_rr2_event);
+    g_rr2_read_status = RR2_DAQ_ReadWindow(&g_rr2_event,
+                                           RR2_EXP_FIRST_CH,
+                                           RR2_EXP_NUM_CH);
 
     if (g_rr2_read_status == RR2_OK) {
         g_rr2_events_ok++;
@@ -460,8 +593,12 @@ static void USB_SendStatusPeriodic(void)
     st.rr2_online     = g_rr2_online;
     st.temp_online    = g_temp_online;
     st.timing_ok      = g_rr2_timing_ok;
+    st.bus_jam        = g_rr2_bus_jam;
     st.cfg_status     = (uint8_t)g_rr2_cfg_status;
     st.read_status    = (uint8_t)g_rr2_read_status;
+    st.cmd_done       = USBCmd_GetDone();
+    st.cmd_failed     = USBCmd_GetFailed();
+    st.cmd_last       = USBCmd_GetLastStatus();
 
     (void)USBStream_SendStatus(&st);
 }

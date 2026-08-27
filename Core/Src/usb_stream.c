@@ -205,12 +205,28 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
             if (!text_push(","))                          { frames_dropped++; return 0u; }
             if (!text_push_i32((int32_t)evt->lg[ch]))     { frames_dropped++; return 0u; }
         }
+        /* HG columns after ALL the LG ones, never interleaved - the
+           text row mirrors the binary payload, so a reader that takes
+           the first 'count' values after the header still gets pure LG
+           whether or not the event carries the second gain. */
+        if (evt->has_hg) {
+            for (uint8_t i = 0u; i < count; ++i) {
+                const uint8_t ch = (uint8_t)(first + i);
+                if (!text_push(","))                      { frames_dropped++; return 0u; }
+                if (!text_push_i32((int32_t)evt->hg[ch])) { frames_dropped++; return 0u; }
+            }
+        }
         if (!text_push("\r\n")) { frames_dropped++; return 0u; }
         return 1u;
     }
 
     /* ---- Binary ---- */
-    const uint16_t payload_len = (uint16_t)(14u + (2u * (uint32_t)count));
+    /* The HG block is announced by nothing but the payload length: the
+       host tests plen against 14 + 4*count. Appended after the LG
+       codes, not interleaved and not a new frame type, so a decoder
+       that predates it keeps working untouched. */
+    const uint16_t payload_len = (uint16_t)(14u + (2u * (uint32_t)count)
+                                     + (evt->has_hg ? (2u * (uint32_t)count) : 0u));
     const uint32_t need        = 2u + 1u + 2u + payload_len + 2u;
 
     if (ring_free() < need) {
@@ -226,6 +242,11 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     put_crc(count);
     for (uint8_t i = 0u; i < count; ++i) {
         put_u16_crc(evt->lg[(uint8_t)(first + i)]);
+    }
+    if (evt->has_hg) {
+        for (uint8_t i = 0u; i < count; ++i) {
+            put_u16_crc(evt->hg[(uint8_t)(first + i)]);
+        }
     }
     put_footer();
     return 1u;
@@ -256,7 +277,7 @@ uint8_t USBStream_SendStatus(const USBStream_Status *st)
         return 1u;
     }
 
-    const uint16_t payload_len = 27u;
+    const uint16_t payload_len = 30u;
     const uint32_t need        = 2u + 1u + 2u + payload_len + 2u;
 
     if (ring_free() < need) {
@@ -273,9 +294,13 @@ uint8_t USBStream_SendStatus(const USBStream_Status *st)
     put_u32_crc((uint32_t)st->temp_milli_c);
     put_crc((uint8_t)((st->rr2_online ? 0x01u : 0u) |
                       (st->temp_online ? 0x02u : 0u) |
-                      (st->timing_ok  ? 0x04u : 0u)));
+                      (st->timing_ok  ? 0x04u : 0u) |
+                      (st->bus_jam    ? 0x08u : 0u)));
     put_crc(st->cfg_status);
     put_crc(st->read_status);
+    put_crc(st->cmd_done);
+    put_crc(st->cmd_failed);
+    put_crc(st->cmd_last);
     put_footer();
     return 1u;
 }
@@ -338,16 +363,23 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 /**
  * @brief One character arrived from the host.
  *
- * Queues it and re-arms immediately. The parsing happens in the main
- * loop, because acting on a command can mean hundreds of milliseconds
- * of blocking I2C and that must never run in interrupt context.
+ * Re-arms before doing anything else. At 921600 baud the next byte is
+ * only 11 us behind this one and USBCmd_Feed() is not free, so arming
+ * after the copy leaves a window with no receive pending - which is how
+ * a burst of typed commands turns into an overrun. The byte is taken
+ * into a local first, because re-arming hands rx_byte back to the ISR.
+ *
+ * The parsing happens in the main loop, because acting on a command can
+ * mean hundreds of milliseconds of blocking I2C and that must never run
+ * in interrupt context.
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != USART3) return;
 
-    USBCmd_Feed(&rx_byte, 1u);
+    const uint8_t byte = rx_byte;
     (void)HAL_UART_Receive_IT(huart, &rx_byte, 1u);
+    USBCmd_Feed(&byte, 1u);
 }
 
 /**
@@ -357,17 +389,37 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
  * control, especially while the host opens or closes the port. Without
  * re-arming here a single glitch would silently kill the command
  * channel for the rest of the session.
+ *
+ * What must not happen here is touching the transmit claim. A receive
+ * overrun says nothing about the span the DMA is still clocking out,
+ * and releasing it on the way past did two things at once: ring_free()
+ * began counting bytes still on the wire as reusable, and clearing
+ * tx_len opened the guard at the top of USBStream_Task(), which then
+ * started a second transfer over the first, got HAL_BUSY, and left the
+ * span unsent with ring_tail already past it. Neither loss increments
+ * frames_dropped, so the reply to whichever command had just blocked
+ * the main loop long enough to cause the overrun - 'push' above all -
+ * went missing with every indicator still green.
  */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != USART3) return;
 
-    /* A transmit-side error leaves the claimed span stranded. Release
-       it so the pump is not wedged forever. */
-    if (tx_len != 0u) {
+    /* The DMA gave up on the transmit. UART_DMAError() has already
+       ended that transfer, so those bytes are never going out and the
+       pump would wait on them forever - this is the one case where the
+       claim is ours to release. */
+    if ((tx_len != 0u) &&
+        ((huart->ErrorCode & HAL_UART_ERROR_DMA) != 0u) &&
+        (huart->gState == HAL_UART_STATE_READY)) {
         ring_tail = (ring_tail + tx_len) & (uint32_t)(USBSTREAM_RING_SIZE - 1u);
         tx_len    = 0u;
     }
 
-    (void)HAL_UART_Receive_IT(huart, &rx_byte, 1u);
+    /* Re-arm only if the HAL really ended the read. It does that for an
+       overrun, which is the error that matters here; framing and noise
+       leave the receive live, and this would just return HAL_BUSY. */
+    if (huart->RxState == HAL_UART_STATE_READY) {
+        (void)HAL_UART_Receive_IT(huart, &rx_byte, 1u);
+    }
 }
