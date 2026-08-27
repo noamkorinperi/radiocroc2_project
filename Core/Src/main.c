@@ -411,7 +411,7 @@ void SystemClock_Config(void)
 /**
  * @brief Start the clock the ASIC's I2C slave core needs.
  *
- * CLK_SM_I2C (PA8 / TIM1_CH1) MUST run at exactly 20x the SCL
+ * CLK_SM_I2C (PA9 / TIM1_CH2) MUST run at exactly 20x the SCL
  * frequency: 100 kHz SCL -> 2 MHz here.
  *
  * CK_READ is deliberately NOT started here. It is burst generated in
@@ -419,7 +419,7 @@ void SystemClock_Config(void)
  */
 static void RR2_StartClocks(void)
 {
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);   /* CLK_SM_I2C, 2 MHz */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);   /* CLK_SM_I2C, 2 MHz */
 }
 
 /**

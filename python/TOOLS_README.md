@@ -32,11 +32,11 @@ python rr2_decode.py --list      # אילו פורטים יש, ומי מהם ה-
 
 ## שעון ה־Slow Control של ה־ASIC
 
-ה־ASIC דורש `clk_sm_i2c = 20 × SCL` בדיוק. השעון יוצא מ־**PA8 / TIM1_CH1** ב־2 MHz מול SCL של 100 kHz, ומוגדר ב־[tim.c](../Core/Src/tim.c) מתוך ה־`.ioc`.
+ה־ASIC דורש `clk_sm_i2c = 20 × SCL` בדיוק. השעון יוצא מ־**PA9 / TIM1_CH2** ב־2 MHz מול SCL של 100 kHz, ומוגדר ב־[tim.c](../Core/Src/tim.c) מתוך ה־`.ioc`.
 
-> ⚠️ **אם מעלים את הקצב** — כלומר מגדילים את SCL, ואיתו את `clk_sm_i2c` מעבר ל־2 MHz — צריך להעביר את PA8 מ־`GPIO_SPEED_FREQ_LOW` ל־`GPIO_SPEED_FREQ_HIGH`. ב־`LOW` זמן הנפילה הוא עשרות ns וזה נגיס מכל חצי־מחזור; ב־2 MHz זה עדיין בסדר, מעל זה כבר לא.
+> ⚠️ **אם מעלים את הקצב** — כלומר מגדילים את SCL, ואיתו את `clk_sm_i2c` מעבר ל־2 MHz — צריך להעביר את PA9 מ־`GPIO_SPEED_FREQ_LOW` ל־`GPIO_SPEED_FREQ_HIGH`. ב־`LOW` זמן הנפילה הוא עשרות ns וזה נגיס מכל חצי־מחזור; ב־2 MHz זה עדיין בסדר, מעל זה כבר לא.
 >
-> **משנים ב־CubeMX, לא ביד:** `System Core → GPIO` → PA8 → `Maximum output speed` → `High` → Generate. השורה ב־`tim.c` יושבת **מחוץ** ל־`USER CODE`, אז עריכה ידנית תימחק ב־generate הבא.
+> **משנים ב־CubeMX, לא ביד:** `System Core → GPIO` → PA9 → `Maximum output speed` → `High` → Generate. השורה ב־`tim.c` יושבת **מחוץ** ל־`USER CODE`, אז עריכה ידנית תימחק ב־generate הבא.
 >
 > שים לב שזה משפר רק את הקצה **היורד**. הקצה העולה נשלט ע"י ה־pull-up של 2.2k ב־PCA9306 ולא ע"י ה־STM32, ולכן לא מושפע מההגדרה הזאת.
 

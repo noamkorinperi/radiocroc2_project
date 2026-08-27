@@ -66,7 +66,7 @@ void Error_Handler(void);
 #define OUT_HG_GPIO_Port GPIOA
 #define OUT_LG_Pin GPIO_PIN_5
 #define OUT_LG_GPIO_Port GPIOA
-#define CLK_SM_I2C_Pin GPIO_PIN_8
+#define CLK_SM_I2C_Pin GPIO_PIN_9
 #define CLK_SM_I2C_GPIO_Port GPIOA
 #define RSTN_I2C_Pin GPIO_PIN_0
 #define RSTN_I2C_GPIO_Port GPIOD
