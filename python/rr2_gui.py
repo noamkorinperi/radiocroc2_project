@@ -6,6 +6,7 @@ Pages
     Main       navigation hub
     Settings   push Slow Control parameters to the ASIC
     Measure    run an acquisition and watch the spectrum build up
+    Scan       sweep DAC1 and find where the rate stops being the source
     History    saved measurements, with Excel export
     Help       static instructions
 
@@ -15,7 +16,9 @@ Requirements
     pillow     pip install pillow        (PNG screenshots)
 
 rr2_decode.py must sit next to this file - it owns the wire protocol so
-there is only one place to change if the framing ever moves.
+there is only one place to change if the framing ever moves. rr2_thscan.py
+must too - it owns the threshold scan for the same reason, so a sweep run
+from the Scan page and one run from a terminal are one measurement.
 
 Run without hardware:
     python rr2_gui.py --sim
@@ -40,6 +43,16 @@ try:
     from rr2_decode import Decoder, LINK_BAUD, find_link_port
 except ImportError:
     sys.exit("rr2_decode.py must be in the same folder as rr2_gui.py")
+
+# The threshold scan, engine and all. The Scan page supplies a Tk state
+# machine in place of the CLI's blocking loop and nothing else: what a
+# point means, what the verdict is, and what gets written to scans/ all
+# live there, so a sweep run from this window and one run from a
+# terminal are the same measurement.
+try:
+    import rr2_thscan as thscan
+except ImportError:
+    sys.exit("rr2_thscan.py must be in the same folder as rr2_gui.py")
 
 try:
     import serial
@@ -1516,6 +1529,8 @@ class PageMain(Page):
                          "thresholds, per-channel enables", "settings"),
             ("Measure", "Run an acquisition and watch the\n"
                         "spectrum accumulate live", "measure"),
+            ("Threshold scan", "Sweep DAC1 and find where the rate\n"
+                               "stops being the source", "scan"),
             ("History", "Saved runs, the settings they were\n"
                         "taken under, and export to Excel", "history"),
             ("Help", "How the system works and the\n"
@@ -1566,6 +1581,8 @@ class PageMain(Page):
         self.app.set_state(True, "simulator")
 
     def disconnect(self):
+        if not self.app.stop_scan_for_shutdown("Disconnecting"):
+            return
         self.app.link.close()
         self.app.set_state(False, "")
 
@@ -2021,6 +2038,16 @@ class PageMeasure(Page):
         if not self.app.link.connected:
             messagebox.showwarning("Offline", "Connect to the board first.")
             return
+        # The scan moves the threshold every few seconds. A spectrum
+        # accumulated across that is a sum over settings, and the record
+        # would name only the one it happened to start on.
+        if self.app.pages["scan"].running:
+            messagebox.showwarning(
+                "Scan running",
+                "A threshold scan is sweeping DAC1 right now, so this "
+                "run would be taken at a threshold that keeps "
+                "changing.\n\nStop the scan first.")
+            return
         level, why = self.app.health.summary(True)
         if level in (LinkHealth.DEAD, LinkHealth.UNSTABLE):
             if not messagebox.askyesno(
@@ -2296,6 +2323,581 @@ class PageMeasure(Page):
         self.app.pages["history"].reload()
 
 
+class PageScan(Page):
+    """Sweep DAC1 and record the trigger rate at every threshold.
+
+    The engine is rr2_thscan.py - the same module the command-line scan
+    runs on, so a sweep started here and one started from a terminal
+    mean the same thing and write the same files. What is written here
+    is only what a window needs and a terminal does not: a state machine
+    instead of a blocking loop, and a table that fills as it goes.
+
+    WHY A STATE MACHINE
+    A scan is set, confirm, dwell, record, over and over, and every step
+    waits on the board. In the CLI that is a while loop. Here the Tk
+    event loop owns the thread, so the waiting is turned inside out:
+    tick() is called every 40 ms by App.pump(), looks at the phase, and
+    either advances it or lets it wait. The window keeps redrawing
+    throughout, and Stop is just a flag.
+
+    Phases
+        prepare   read the board's globals, so dac2/dacq carry through
+                  untouched and there is a threshold to go back to
+        set       'th' sent, waiting for the completed counter to move
+        verify    dump sent, waiting for the register to read back
+        dwell     counting, until enough triggers or long enough
+        restore   set + verify once more, on the way out
+    """
+
+    title = "Threshold scan"
+
+    COLS = (("dac1", 60), ("trig_cps", 90), ("counts", 75), ("read_cps", 90),
+            ("host_cps", 90), ("dead", 60), ("excess", 70), ("note", 250))
+
+    def build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Button(top, text="< Main", command=lambda: self.app.show("main"))\
+            .pack(side="left")
+        ttk.Label(top, text="Threshold scan", style="H1.TLabel")\
+            .pack(side="left", padx=12)
+        ttk.Label(top, text="where the rate stops being the source and "
+                            "starts being noise", style="Sub.TLabel")\
+            .pack(side="left", padx=8)
+
+        def spin(parent, text, var, lo, hi, row, col, width=7, hint=""):
+            ttk.Label(parent, text=text).grid(row=row, column=col, sticky="w",
+                                              pady=3)
+            ttk.Spinbox(parent, from_=lo, to=hi, textvariable=var,
+                        width=width)\
+                .grid(row=row, column=col + 1, sticky="w", padx=(6, 18),
+                      pady=3)
+            if hint:
+                ttk.Label(parent, text=hint, style="Sub.TLabel")\
+                    .grid(row=row, column=col + 2, sticky="w", pady=3)
+
+        sweep = ttk.LabelFrame(self, text="Sweep", padding=12)
+        sweep.pack(fill="x", pady=10)
+        self.v_start = tk.IntVar(value=320)
+        self.v_stop = tk.IntVar(value=80)
+        self.v_step = tk.IntVar(value=20)
+        spin(sweep, "Start dac1", self.v_start, 0, 1023, 0, 0)
+        spin(sweep, "Stop", self.v_stop, 0, 1023, 0, 2)
+        spin(sweep, "Step", self.v_step, 1, 512, 0, 4,
+             hint="high to low is the useful direction")
+
+        ttk.Label(sweep, text="or Values").grid(row=1, column=0, sticky="w",
+                                                pady=3)
+        self.v_values = tk.StringVar(value="")
+        ttk.Entry(sweep, textvariable=self.v_values, width=34)\
+            .grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 18),
+                  pady=3)
+        ttk.Label(sweep, text="e.g.  300,280,260 - overrides the range above",
+                  style="Sub.TLabel")\
+            .grid(row=1, column=4, columnspan=3, sticky="w", pady=3)
+
+        dwell = ttk.LabelFrame(self, text="Per point", padding=12)
+        dwell.pack(fill="x", pady=(0, 10))
+        self.v_dwell = tk.IntVar(value=30)
+        self.v_min_dwell = tk.IntVar(value=6)
+        self.v_counts = tk.IntVar(value=300)
+        spin(dwell, "Dwell max (s)", self.v_dwell, 1, 3600, 0, 0)
+        spin(dwell, "Dwell min (s)", self.v_min_dwell, 1, 3600, 0, 2)
+        spin(dwell, "Move on at (counts)", self.v_counts, 1, 1000000, 0, 4,
+             width=9, hint="relative error is 1/sqrt(counts)")
+
+        ttk.Label(dwell, text="Abort above (cps)")\
+            .grid(row=1, column=0, sticky="w", pady=3)
+        self.v_maxrate = tk.StringVar(value="")
+        ttk.Entry(dwell, textvariable=self.v_maxrate, width=9)\
+            .grid(row=1, column=1, sticky="w", padx=(6, 18), pady=3)
+        # The gap is the point of the padx: this hint is the widest thing
+        # in its column, and without it the next label starts flush
+        # against the end of the sentence.
+        ttk.Label(dwell, text="blank = run the whole sweep",
+                  style="Sub.TLabel")\
+            .grid(row=1, column=2, columnspan=2, sticky="w", padx=(0, 24),
+                  pady=3)
+        self.v_ch = tk.IntVar(value=0)
+        spin(dwell, "Signal channel", self.v_ch, 0, 63, 1, 4)
+
+        ttk.Label(dwell, text="Label").grid(row=2, column=0, sticky="w",
+                                            pady=3)
+        self.v_label = tk.StringVar(value="")
+        ttk.Entry(dwell, textvariable=self.v_label, width=28)\
+            .grid(row=2, column=1, columnspan=3, sticky="w", padx=(6, 18),
+                  pady=3)
+        ttk.Label(dwell, text="goes into the file names, like a Run label",
+                  style="Sub.TLabel")\
+            .grid(row=2, column=4, columnspan=3, sticky="w", pady=3)
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        self.btn_start = ttk.Button(bar, text="Start scan",
+                                    style="Accent.TButton", command=self.start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(bar, text="Stop", command=self.stop,
+                                   state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        ttk.Button(bar, text="Clear", command=self.clear).pack(side="left")
+        # Same reason as on Measure: a sweep against a link that has
+        # quietly stopped produces a table of zeros and no complaint.
+        self.light = HealthLight(bar)
+        self.light.pack(side="left", padx=(24, 0))
+        ttk.Button(bar, text="Save plot PNG", command=self.shot_table)\
+            .pack(side="right")
+
+        self.lbl = ttk.Label(self, text="idle", style="Sub.TLabel")
+        self.lbl.pack(fill="x", pady=(10, 4))
+
+        # Verdict first, and from the bottom. Two forms and a button bar
+        # already ask for most of a 740-pixel window, and the packer
+        # gives whatever comes last the cavity that is left - which was
+        # nothing, so the one part of this page that answers the question
+        # rendered as a title and no text. The table expands, so it
+        # absorbs the shortfall instead. Same reasoning as the History
+        # button bar and the Measure status line.
+        vf = ttk.LabelFrame(self, text="Verdict", padding=6)
+        vf.pack(fill="x", side="bottom", pady=(10, 0))
+        self.verdict = tk.Text(vf, height=7, wrap="word", relief="flat",
+                               bg=C_PANEL, fg=C_TEXT, font=("Consolas", 9))
+        self.verdict.pack(fill="x")
+        self.verdict.configure(state="disabled")
+
+        # A table of rates is not an answer on its own. Which of them is
+        # still the source is the answer, and that needs the sentence
+        # above - the same sentence the CLI prints, from one function.
+        self.tree = ttk.Treeview(self, columns=[c for c, _ in self.COLS],
+                                 show="headings", height=8)
+        for name, width in self.COLS:
+            self.tree.heading(name, text=name.replace("_", " "))
+            self.tree.column(name, width=width,
+                             anchor="w" if name == "note" else "center")
+        self.tree.pack(fill="both", expand=True)
+
+        self._reset_state()
+
+    # -- state
+    def _reset_state(self):
+        self.running = False
+        self.phase = "idle"
+        self.values = []
+        self.idx = 0
+        self.rows = []
+        self.restoring = False
+        self.deadline = 0.0
+        self.point_t0 = 0.0
+        self.frames = []            # status frames inside this dwell
+        self.seen = []              # (t_ms, sig, ped) inside this dwell
+        self.pending = []           # event frames awaiting reduction
+        self.cmd_done0 = None
+        self.cmd_failed0 = 0
+        self.dac1_at_start = None
+        self.dac2 = 500
+        self.dacq = 200
+        self.stopped_why = ""
+        self.started_at = None
+        self.stat_at_start = {}
+        self.glob_at_start = []
+        # Frozen at Start. The spinbox can be moved mid-sweep, and the
+        # dark-channel pedestal only means anything if every point in a
+        # scan was read against the same signal channel.
+        self.sig_ch = 0
+
+    def clear(self):
+        if self.running:
+            return
+        self.tree.delete(*self.tree.get_children())
+        self._set_verdict([])
+        self.rows = []
+        self.lbl.configure(text="idle")
+
+    # -- control
+    def start(self):
+        if self.running:
+            return
+        if not self.app.link.connected:
+            messagebox.showwarning("Offline", "Connect to the board first.")
+            return
+        if self.app.link.sim:
+            messagebox.showwarning(
+                "Simulator",
+                "The simulator generates a spectrum. It has no Slow "
+                "Control and no threshold to move.\n\n"
+                "A scan needs the real board.")
+            return
+        # One threshold, two owners. A scan moving DAC1 under a running
+        # acquisition would rewrite the very setting that run is being
+        # saved with, and nothing downstream would ever show it.
+        if self.app.pages["measure"].running:
+            messagebox.showwarning(
+                "Measurement running",
+                "A scan changes the threshold under the acquisition.\n\n"
+                "Stop the run on the Measure page first.")
+            return
+
+        level, why = self.app.health.summary(True)
+        if level in (LinkHealth.DEAD, LinkHealth.UNSTABLE):
+            if not messagebox.askyesno(
+                    "Link is not healthy",
+                    f"The link reports: {level} - {why}\n\n"
+                    "A scan needs every command confirmed and every "
+                    "heartbeat counted.\n\nStart anyway?"):
+                return
+
+        # Without the command counters there is no telling a setting that
+        # applied from one whose reply was simply lost - and a scan is a
+        # few dozen settings in a row.
+        last = self.app.cmd_counters()
+        if last is None:
+            messagebox.showwarning(
+                "No command counters",
+                "This firmware does not report command results in its "
+                "status frame, so a threshold cannot be confirmed.\n\n"
+                "Wait for a heartbeat, or update the firmware.")
+            return
+
+        try:
+            values = thscan.sweep_values(self.v_start.get(), self.v_stop.get(),
+                                         self.v_step.get(),
+                                         self.v_values.get().strip())
+            if self.v_min_dwell.get() > self.v_dwell.get():
+                raise ValueError("dwell min cannot be longer than dwell max")
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror("Sweep", str(exc))
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        self._set_verdict([])
+        self.rows = []
+        self.values = values
+        self.idx = 0
+        self.running = True
+        self.restoring = False
+        self.stopped_why = ""
+        self.started_at = datetime.now()
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+
+        # Ask what the board is set to now: dac2 and dacq have to ride
+        # through untouched, and dac1 is where the scan goes back to.
+        self.sig_ch = self.v_ch.get()
+        self.app.state.glob_raw = []
+        self.app.link.send("stat")
+        self.app.link.send(f"ch {self.sig_ch} dump")
+        self.phase = "prepare"
+        self.deadline = time.monotonic() + thscan.DUMP_TIMEOUT_S
+        self.lbl.configure(text="reading the board's current settings...")
+
+    def stop(self):
+        """Stop the sweep and put the threshold back."""
+        if not self.running:
+            return
+        if not self.stopped_why:
+            self.stopped_why = "stopped by the operator"
+        self._begin_restore()
+
+    # -- frames, from App.pump()
+    def feed(self, frame):
+        if self.phase != "dwell":
+            return
+        kind = frame.get("type")
+        if kind == "status":
+            self.frames.append(frame)
+        elif kind == "event":
+            self.pending.append(frame)
+
+    # -- the state machine
+    def tick(self):
+        if not self.running:
+            return
+        {"prepare": self._tick_prepare,
+         "set": self._tick_set,
+         "verify": self._tick_verify,
+         "dwell": self._tick_dwell}.get(self.phase, lambda: None)()
+
+    def _tick_prepare(self):
+        glob = self.app.state.glob_raw
+        if len(glob) >= 8:
+            g = decode_globals(glob)
+            self.dac1_at_start = g["dac1"]
+            self.dac2, self.dacq = g["dac2"], g["dacq"]
+            self.glob_at_start = list(glob)
+            self.stat_at_start = dict(self.app.state.stat)
+            if g["selTrig"] not in (0x1, 0x4):
+                self.app.toast("note: selTrig=0x%X is not the T1 trigger, so "
+                               "the rate may not follow DAC1" % g["selTrig"],
+                               ms=12000)
+            self._begin_point()
+            return
+        if time.monotonic() > self.deadline:
+            self._finish("the board never answered 'ch N dump' - nothing "
+                         "was changed")
+
+    def _tick_set(self):
+        now = self.app.cmd_counters()
+        if now is not None and self.cmd_done0 is not None:
+            done, failed, last = now
+            # Both counters wrap at 256, so only differences mean anything.
+            if ((done - self.cmd_done0) & 0xFF) >= 1:
+                if (failed - self.cmd_failed0) & 0xFF:
+                    self._fail_point("the ASIC refused the write "
+                                     "(cmd_last=%s)" % last)
+                    return
+                # Confirmed as run. Whether it ran with the value that
+                # was asked for is the next phase's question.
+                self.app.state.glob_raw = []
+                self.app.link.send(f"ch {self.sig_ch} dump")
+                self.phase = "verify"
+                self.deadline = time.monotonic() + thscan.DUMP_TIMEOUT_S
+                return
+        if time.monotonic() > self.deadline:
+            self._fail_point("not confirmed by the board within %.0f s"
+                             % thscan.CONFIRM_TIMEOUT_S)
+
+    def _tick_verify(self):
+        glob = self.app.state.glob_raw
+        if len(glob) >= 8:
+            got = decode_globals(glob).get("dac1")
+            want = self._target()
+            if got != want:
+                self._fail_point("readback says dac1=%s, not %d" % (got, want))
+                return
+            if self.restoring:
+                self._finish("")
+                return
+            self.phase = "dwell"
+            self.point_t0 = time.monotonic()
+            self.frames = []
+            self.seen = []
+            self.pending = []
+            return
+        if time.monotonic() > self.deadline:
+            self._fail_point("no readback - the dump never came back")
+
+    def _tick_dwell(self):
+        if self.pending:
+            self.seen.extend(thscan.reduce_events(self.pending,
+                                                  self.sig_ch))
+            self.pending = []
+
+        elapsed = time.monotonic() - self.point_t0
+        counts = thscan.window_counts(self.frames)
+        self.lbl.configure(
+            text="point %d of %d   dac1=%d   dwelling %.0f of %d s   "
+                 "%d counts (target %d)%s"
+                 % (self.idx + 1, len(self.values), self._target(), elapsed,
+                    self.v_dwell.get(), counts, self.v_counts.get(),
+                    self._silence_note(elapsed)))
+
+        done = elapsed >= self.v_dwell.get()
+        if not done and elapsed >= self.v_min_dwell.get():
+            done = counts >= self.v_counts.get()
+        if not done:
+            return
+
+        row = thscan.summarise_window(list(self.frames), self.seen)
+        row["dac1"] = self._target()
+        row["confirmed"] = True
+        self._add_row(row)
+
+        limit = self._max_rate()
+        if limit is not None and row.get("trig_cps", 0) > limit:
+            self.stopped_why = ("stopped at dac1=%d: %.0f cps is past the "
+                                "abort limit of %.0f"
+                                % (row["dac1"], row["trig_cps"], limit))
+            self._begin_restore()
+            return
+        self._next_point()
+
+    def _silence_note(self, elapsed):
+        """Why nothing is arriving, when nothing is arriving.
+
+        A dwell with no counts is the expected answer above the noise
+        wall, and a dead link is not, but on this table they look the
+        same. Same question as PageMeasure._silence_note, same source.
+
+        Deliberately silent about "unstable", which on the Measure page
+        is a warning and here is the forecast: below the wall the board
+        drops frames by the thousand because the rate is past what the
+        link carries, and that is the measurement working, not failing.
+        The dropped and dead columns report it as a number instead.
+        """
+        level = self.app.health.level(self.app.link.connected)
+        if level in (LinkHealth.DEAD, LinkHealth.OFFLINE):
+            return "   <<  LINK DOWN - this point is not being measured"
+        return ""
+
+    # -- steps
+    def _target(self):
+        if self.restoring:
+            return (self.dac1_at_start if self.dac1_at_start is not None
+                    else self.values[0])
+        return self.values[self.idx]
+
+    def _max_rate(self):
+        text = self.v_maxrate.get().strip()
+        try:
+            return float(text) if text else None
+        except ValueError:
+            return None
+
+    def _next_point(self):
+        self.idx += 1
+        if self.idx >= len(self.values):
+            self._begin_restore()
+        else:
+            self._begin_point()
+
+    def _begin_point(self):
+        self._send_threshold(self._target())
+        self.lbl.configure(text="point %d of %d   setting dac1=%d..."
+                                % (self.idx + 1, len(self.values),
+                                   self._target()))
+
+    def _begin_restore(self):
+        self.restoring = True
+        if self.dac1_at_start is None:
+            self._finish("")        # nothing was ever changed
+            return
+        self._send_threshold(self.dac1_at_start)
+        self.lbl.configure(text="restoring dac1=%d..." % self.dac1_at_start)
+
+    def _send_threshold(self, dac1):
+        counters = self.app.cmd_counters()
+        self.cmd_done0 = counters[0] if counters else None
+        self.cmd_failed0 = counters[1] if counters else 0
+        self.app.link.send("th %d %d %d" % (dac1, self.dac2, self.dacq))
+        self.phase = "set"
+        self.deadline = time.monotonic() + thscan.CONFIRM_TIMEOUT_S
+
+    def _fail_point(self, why):
+        """This threshold could not be trusted, so it is not measured."""
+        if self.restoring:
+            self._finish("RESTORE FAILED: %s.  The board may still be at a "
+                         "scan threshold - check it with 'ch %d dump' before "
+                         "the next run." % (why, self.sig_ch))
+            return
+        self._add_row({"dac1": self._target(), "confirmed": False,
+                       "status_frames": 0, "note": why})
+        self._next_point()
+
+    def _finish(self, error):
+        self.running = False
+        self.phase = "idle"
+        self.restoring = False
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+
+        saved = self._save() if self.rows else ""
+        lines = []
+        if error:
+            lines += [error, ""]
+        if self.stopped_why:
+            lines += [self.stopped_why, ""]
+        lines += (thscan.recommend(self.rows, self.dac2, self.dacq)
+                  if self.rows else ["No points were measured."])
+        if saved:
+            lines += ["", "saved  " + saved]
+        self._set_verdict(lines)
+
+        measured = sum(1 for r in self.rows if "trig_cps" in r)
+        self.lbl.configure(text="finished: %d of %d points measured"
+                                % (measured, len(self.values)))
+        if error:
+            self.app.toast(error, ms=15000)
+
+    # -- output
+    def _add_row(self, row):
+        self.rows.append(row)
+
+        def num(key, fmt="%.2f"):
+            v = row.get(key, "")
+            return fmt % v if isinstance(v, (int, float)) else "-"
+
+        dead = row.get("dead_frac", "")
+        self.tree.insert("", "end", values=(
+            row["dac1"],
+            num("trig_cps"),
+            row.get("trig_counts", "-"),
+            num("read_cps"),
+            num("host_cps"),
+            ("%.0f%%" % (dead * 100)) if isinstance(dead, float) else "-",
+            num("excess", "%.0f"),
+            row.get("note", ""),
+        ))
+        self.tree.yview_moveto(1.0)
+
+    def _set_verdict(self, lines):
+        self.verdict.configure(state="normal")
+        self.verdict.delete("1.0", "end")
+        self.verdict.insert("1.0", "\n".join(lines))
+        self.verdict.configure(state="disabled")
+
+    def _save(self):
+        """Write the same CSV + JSON pair the command-line scan writes."""
+        header = {
+            "started": (self.started_at.strftime("%Y-%m-%d %H:%M:%S")
+                        if self.started_at else ""),
+            "finished": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "rr2_gui",
+            "label": self.v_label.get().strip(),
+            "signal_channel": self.sig_ch,
+            "values": self.values,
+            "dwell_s": self.v_dwell.get(),
+            "min_dwell_s": self.v_min_dwell.get(),
+            "target_counts": self.v_counts.get(),
+            "max_rate_cps": self._max_rate(),
+            "dac1_at_start": self.dac1_at_start,
+            "dac2": self.dac2,
+            "dacq": self.dacq,
+            "restore_to": self.dac1_at_start,
+            "global_at_start": decode_globals(self.glob_at_start),
+            "global_raw_at_start": " ".join("%02X" % v
+                                            for v in self.glob_at_start),
+            "stat_at_start": self.stat_at_start,
+            "stopped": self.stopped_why,
+            "link": self.app.health.snapshot(self.app.link.connected),
+        }
+        label = self.v_label.get().strip().replace(" ", "_")
+        name = "thscan_%s%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                ("_" + label) if label else "")
+        try:
+            os.makedirs(thscan.SCAN_DIR, exist_ok=True)
+            csv_path, _ = thscan.write_outputs(
+                os.path.join(thscan.SCAN_DIR, name), header, self.rows)
+        except OSError as exc:
+            self.app.toast("could not save the scan: %s" % exc, ms=15000)
+            return ""
+        base = os.path.basename(csv_path)[:-4]
+        self.app.toast("saved  scans/" + base + ".csv")
+        return "scans/%s.csv  and  scans/%s.json" % (base, base)
+
+    def shot_table(self):
+        self.app.screenshot([self.tree, self.verdict],
+                            self.v_label.get().strip(), kind="thscan")
+
+    # -- shutdown
+    def blind_restore(self):
+        """Send the threshold back with no chance to confirm it.
+
+        For the two paths where the port is about to close underneath a
+        running scan - Disconnect, and the window shutting. Nothing can
+        be waited for, so the write goes out, the UART is given a moment
+        to drain, and the caller is told it was never confirmed.
+        """
+        was_running = self.running and self.dac1_at_start is not None
+        if was_running:
+            self.app.link.send("th %d %d %d"
+                               % (self.dac1_at_start, self.dac2, self.dacq))
+            time.sleep(0.2)
+        self._reset_state()
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        self.lbl.configure(text="idle")
+        return was_running
+
+
 class PageHistory(Page):
     title = "History"
 
@@ -2476,12 +3078,18 @@ ORDER OF OPERATIONS
        - Press Apply. Nothing on this page reaches the chip until you
          do, and the saved record will say so if you forget.
 
-    3. Measure
+    3. Threshold scan
+       Rather than guessing at DAC1, sweep it. The scan measures the
+       trigger rate at every threshold and says where the counts stop
+       being the source and start being the noise floor. Set what it
+       recommends, with margin. See THRESHOLD SCAN below.
+
+    4. Measure
        Choose the channel, set the bin count and a duration, then
        Start. The spectrum builds up live. Save Measurement when it
        looks reasonable.
 
-    4. History
+    5. History
        Select a run to preview it and read the settings it was taken
        under, then Export to Excel.
 
@@ -2514,8 +3122,8 @@ WHAT EVERY SETTING DOES - PER CHANNEL
     lgGain  (0-15, default 4)
         Gain of the low-gain charge preamp, spanning about x0.5 to x8
         across the sixteen steps. This is the pulse height knob,
-        because OUT_AMUXLG is the only signal on this board that
-        reaches an ADC.
+        because OUT_AMUXLG is the only signal this firmware
+        reads out.
         Raise it and the spectrum stretches towards higher ADC
         channels. Too far and the photopeak piles up against 1638: the
         peak stops moving, grows a hard edge, and the saturated counter
@@ -2605,7 +3213,7 @@ WHAT EVERY SETTING DOES - GLOBAL
 
     Threshold DACQ charge  (0-1023, default 200)
         Threshold of the charge discriminator, which runs off the high
-        gain chain. HG is not digitised on this board, but its
+        gain chain. HG reaches PA4 but is never read; its
         discriminator still works, so this matters if selTrig selects
         the charge trigger. Otherwise it does nothing.
 
@@ -2646,7 +3254,7 @@ WHAT EVERY SETTING DOES - GLOBAL
 
     AMUX LG buffer
         Powers the buffer that drives OUT_AMUXLG - the one analog pin
-        the ADC is wired to. Off, the ADC reads the same flat value for
+        this firmware reads. Off, the ADC reads the same flat value for
         every event no matter what the detector does.
         It should always be on. It has a control here only so that
         "every event reads the same number" has somewhere obvious to be
@@ -2713,15 +3321,72 @@ WHAT EVERY SETTING DOES - MEASURE PAGE
         Analysis that needs a pedestal needs this file. It costs disk,
         not counts.
 
+THRESHOLD SCAN
+    Setting DAC1 by hand is guesswork: too high and the low end of the
+    spectrum is gone, too low and the chip free-runs on its own noise,
+    and from a single rate you cannot tell which side you are on. The
+    Scan page sweeps DAC1 and measures the trigger rate at every value,
+    which is what makes the boundary visible.
+
+    Each point is set, confirmed, dwelt on, and recorded. dac2 and dacq
+    ride through untouched, and the threshold goes back to where it
+    started when the scan ends - including on Stop, on Disconnect, and
+    on closing the window.
+
+    Sweep
+        Start, Stop and Step, or an explicit list of values that
+        overrides them. High to low is the useful direction: it begins
+        where the board is quiet and walks into the noise.
+
+    Dwell max / Dwell min / Move on at
+        A point ends once it has collected the target count, but never
+        before the minimum and never after the maximum. Noisy points
+        are over in seconds; quiet ones get the full dwell. The
+        relative error of a point is 1/sqrt(counts), so 300 counts is
+        6 per cent and 9 counts is 33 and is not a measurement.
+
+    Abort above
+        Stop the sweep once a point passes this rate. Leave it blank to
+        run the whole thing.
+
+    The four columns
+        trig cps    what NOR_T1 actually did. Counted from the board's
+                    own trigger counter, not from arriving events: past
+                    about 3100 events a second the link cannot carry
+                    them and the firmware drops the rest, so counting
+                    arrivals would flatten the curve exactly where it
+                    matters.
+        read cps    what the readout digitised. Below trig cps is dead
+                    time, about 38 microseconds an event, not a fault.
+        host cps    what survived the link.
+        excess      the median code of the signal channel, above the
+                    pedestal. This is the column that decides. Lowering
+                    the threshold admits more Compton continuum AND
+                    more noise, and both look like a rising rate; the
+                    dark channels give the pedestal from the same
+                    events, and a trigger that does not lift the signal
+                    channel above it carried no energy. When excess
+                    collapses, the rate has stopped being physics.
+
+    The verdict box names the wall and the best clean point - the
+    lowest threshold that still buys real events - and prints the th
+    command for it. Leave margin above it: the wall moves with
+    temperature and with HV.
+
+    Every scan writes a CSV and a JSON into scans/, with the registers
+    it ran under. The same sweep can be run without the GUI:
+    python rr2_thscan.py --start 300 --stop 120 --step 20
+
 WHICH SIGNAL IS MEASURED
-    Only OUT_AMUXLG is wired to an ADC, so every spectrum here is the
+    Only OUT_AMUXLG is read out, so every spectrum here is the
     low gain path: one ADC code per channel per event, and the x axis is
     raw ADC counts. There is no gain choice to make and nothing to
     cross-calibrate.
 
     The ASIC still has a high gain chain and the charge trigger is
     derived from it, but nothing digitises it: its output pad,
-    OUT_AMUXHG, is not connected and its mux buffer is written off. So
+    OUT_AMUXHG, reaches PA4 / ADC1_IN4 but goes unread, and its mux
+    buffer is written off. So
     it has no controls on the Settings page, and applying a channel
     leaves its registers exactly as they were. If you ever do need it,
     the console still takes the second argument:
@@ -2938,11 +3603,17 @@ FILES
        - לחץ Apply. שום דבר בעמוד הזה לא מגיע לשבב לפני כן, והרשומה
          השמורה תגיד את זה אם תשכח.
 
-    3. Measure
+    3. Threshold scan
+       במקום לנחש את DAC1, סרוק אותו. הסריקה מודדת את קצב הטריגר
+       בכל סף ואומרת איפה הספירות מפסיקות להיות המקור ומתחילות
+       להיות רצפת הרעש. קבע את מה שהיא ממליצה, עם מרווח. ראה
+       "סריקת סף" למטה.
+
+    4. Measure
        בחר ערוץ, קבע מספר תאים ומשך, ולחץ Start. הספקטרום נבנה
        בזמן אמת. לחץ Save measurement כשהוא נראה סביר.
 
-    4. History
+    5. History
        בחר ריצה כדי לראות אותה ואת ההגדרות שבהן נמדדה, ואז
        Export to Excel.
 
@@ -2971,7 +3642,7 @@ FILES
     lgGain  (0-15, ברירת מחדל 4)
         ההגבר של מגבר המטען בערוץ ה-low gain, בטווח של בערך x0.5 עד
         x8 לאורך שישה עשר הצעדים. זהו הכפתור לגובה הפולס, כי
-        OUT_AMUXLG הוא האות היחיד בלוח הזה שמגיע ל-ADC.
+        OUT_AMUXLG הוא האות היחיד שהקושחה קוראת.
         העלאה שלו מותחת את הספקטרום כלפי ערוצי ADC גבוהים יותר. יותר
         מדי, והפוטו-פיק נערם על 1638: הפיק מפסיק לזוז, מקבל קצה חד,
         ומונה ה-saturated בעמוד Measure מתחיל לטפס. התקרה הזו
@@ -3048,8 +3719,8 @@ FILES
         selTrig מנתב אותו. בדרך כלל השאר אותו מעל DAC1 והתעלם.
 
     Threshold DACQ charge  (0-1023, ברירת מחדל 200)
-        הסף של דיסקרימינטור המטען, שרץ ממסלול ה-high gain. ה-HG אינו
-        מדוגם בלוח הזה, אבל הדיסקרימינטור שלו עדיין עובד, ולכן זה
+        הסף של דיסקרימינטור המטען, שרץ ממסלול ה-high gain. ה-HG מגיע
+        ל-PA4 אך אינו נקרא, והדיסקרימינטור שלו עדיין עובד, ולכן זה
         משנה אם selTrig בוחר בטריגר המטען. אחרת הוא לא עושה דבר.
 
     Hold delay  (0-255)  ו-Slope trim  (0-15)
@@ -3084,7 +3755,7 @@ FILES
 
     AMUX LG buffer
         מפעיל את המאגר שמניע את OUT_AMUXLG - הפין האנלוגי היחיד
-        שה-ADC מחובר אליו. כבוי, ה-ADC קורא את אותו ערך שטוח לכל
+        שהקושחה קוראת. כבוי, ה-ADC קורא את אותו ערך שטוח לכל
         אירוע, לא משנה מה הגלאי עושה.
         הוא צריך להיות דלוק תמיד. יש לו פקד כאן רק כדי של"כל אירוע
         קורא את אותו מספר" יהיה מקום ברור להיבדק בו.
@@ -3143,14 +3814,66 @@ FILES
         כותב כל אירוע, כל ערוץ, ל-CSV תחת raw/. כל ניתוח שצריך
         פדסטל צריך את הקובץ הזה. הוא עולה בדיסק, לא בספירות.
 
+סריקת סף
+    לקבוע את DAC1 ביד זה ניחוש: גבוה מדי והקצה הנמוך של הספקטרום
+    נעלם, נמוך מדי והשבב רץ חופשי על הרעש של עצמו, ומקצב בודד אי
+    אפשר לדעת באיזה צד אתה. עמוד Scan סורק את DAC1 ומודד את קצב
+    הטריגר בכל ערך, וזה מה שהופך את הגבול לנראה.
+
+    כל נקודה נקבעת, מאושרת, שוהה, ונרשמת. dac2 ו-dacq עוברים בלי
+    שינוי, והסף חוזר למקום שבו היה כשהסריקה נגמרת - גם ב-Stop, גם
+    ב-Disconnect, וגם בסגירת החלון.
+
+    Sweep
+        Start, Stop ו-Step, או רשימת ערכים מפורשת שגוברת עליהם.
+        מגבוה לנמוך הוא הכיוון השימושי: מתחילים איפה שהלוח שקט
+        והולכים לתוך הרעש.
+
+    Dwell max / Dwell min / Move on at
+        נקודה נגמרת ברגע שאספה את מספר הספירות המבוקש, אבל אף פעם
+        לא לפני המינימום ואף פעם לא אחרי המקסימום. נקודה רועשת
+        נגמרת בשניות, שקטה מקבלת את מלוא הזמן. השגיאה היחסית של
+        נקודה היא 1/sqrt(counts): 300 ספירות הן 6 אחוז, ו-9
+        ספירות הן 33 אחוז וזו לא מדידה.
+
+    Abort above
+        עוצר את הסריקה ברגע שנקודה עוברת את הקצב הזה. ריק =
+        להריץ את הכל.
+
+    ארבע העמודות
+        trig cps    מה ש-NOR_T1 באמת עשה. נספר ממונה הטריגרים של
+                    הלוח עצמו ולא מאירועים שהגיעו: מעבר לכ-3100
+                    אירועים בשנייה הקו לא נושא אותם והקושחה זורקת
+                    את השאר, כך שספירת מה שהגיע הייתה משטיחה את
+                    העקומה בדיוק במקום החשוב.
+        read cps    מה שהקריאה הספיקה לדגום. פחות מ-trig cps זה
+                    זמן מת, בערך 38 מיקרושניות לאירוע, לא תקלה.
+        host cps    מה ששרד את הקו.
+        excess      חציון הקוד של ערוץ האות, מעל הפדסטל. זו
+                    העמודה שמכריעה. הורדת הסף מכניסה גם עוד רצף
+                    Compton וגם עוד רעש, ושניהם נראים כמו קצב
+                    שעולה; הערוצים החשוכים נותנים את הפדסטל מאותם
+                    אירועים, וטריגר שלא מרים את ערוץ האות מעליו
+                    לא נשא אנרגיה. כשה-excess קורס, הקצב הפסיק
+                    להיות פיזיקה.
+
+    תיבת ה-Verdict מציינת את הקיר ואת הנקודה הנקייה הטובה ביותר -
+    הסף הנמוך ביותר שעדיין קונה אירועים אמיתיים - ומדפיסה את פקודת
+    ה-th עבורה. השאר מרווח מעליה: הקיר זז עם הטמפרטורה ועם ה-HV.
+
+    כל סריקה כותבת CSV ו-JSON לתיקיית scans/, עם הרגיסטרים שתחתם
+    רצה. אפשר להריץ את אותה סריקה בלי ה-GUI:
+    python rr2_thscan.py --start 300 --stop 120 --step 20
+
 איזה אות נמדד
-    רק OUT_AMUXLG מחובר ל-ADC, ולכן כל ספקטרום כאן הוא מסלול ה-low
+    רק OUT_AMUXLG נקרא, ולכן כל ספקטרום כאן הוא מסלול ה-low
     gain: קוד ADC אחד לכל ערוץ לכל אירוע, וציר ה-X הוא ספירות ADC
     גולמיות. אין מה לבחור בין מסלולי הגבר ואין מה לכייל ביניהם.
 
     ל-ASIC עדיין יש מסלול high gain וטריגר המטען נגזר ממנו, אבל אף
-    אחד לא מדגם אותו: פד היציאה שלו, OUT_AMUXHG, אינו מחובר והמאגר
-    שלו נכתב כבוי. לכן אין לו פקדים בעמוד Settings, ו-Apply channel
+    אחד לא קורא אותו: פד היציאה שלו, OUT_AMUXHG, מגיע ל-PA4 / ADC1_IN4
+    אך אינו נקרא, והמאגר שלו נכתב כבוי. לכן אין לו פקדים בעמוד
+    Settings, ו-Apply channel
     משאיר את הרגיסטרים שלו בדיוק כפי שהיו. אם בכל זאת תצטרך אותו,
     הקונסולה עדיין מקבלת ארגומנט שני:
 
@@ -3491,6 +4214,7 @@ class App(tk.Tk):
         self.state = DeviceState()
         self.health = LinkHealth()
         self.cmdwatch = CmdWatch()
+        self.last_status = None      # newest status frame, see cmd_counters()
         self._health_at = 0.0
         self._style()
 
@@ -3520,8 +4244,8 @@ class App(tk.Tk):
 
         self.pages = {}
         for key, cls in (("main", PageMain), ("settings", PageSettings),
-                         ("measure", PageMeasure), ("history", PageHistory),
-                         ("help", PageHelp)):
+                         ("measure", PageMeasure), ("scan", PageScan),
+                         ("history", PageHistory), ("help", PageHelp)):
             pg = cls(container, self)
             pg.grid(row=0, column=0, sticky="nsew")
             self.pages[key] = pg
@@ -3639,9 +4363,12 @@ class App(tk.Tk):
             except queue.Empty:
                 break
             drained += 1
+            if frame.get("type") == "status":
+                self.last_status = frame
             self.health.on_frame(frame)
             self.show_cmd_verdict(self.cmdwatch.on_frame(frame))
             self.pages["measure"].feed(frame)
+            self.pages["scan"].feed(frame)
 
         while True:
             try:
@@ -3663,7 +4390,23 @@ class App(tk.Tk):
             self.show_cmd_verdict(self.cmdwatch.poll())
 
         self.pages["measure"].tick()
+        self.pages["scan"].tick()
         self.after(40, self.pump)
+
+    # -- command counters
+    def cmd_counters(self):
+        """(done, failed, last) from the newest status frame, or None.
+
+        None means this firmware does not report command results, so
+        anything that needs a setting confirmed should not be attempted
+        against it - a lost reply and a command that never ran are
+        indistinguishable without these.
+        """
+        st = self.last_status
+        if not st or st.get("cmd_done") is None:
+            return None
+        return (st["cmd_done"], st.get("cmd_failed", 0),
+                st.get("cmd_last", "?"))
 
     # -- command confirmation
     def show_cmd_verdict(self, verdict):
@@ -3687,8 +4430,36 @@ class App(tk.Tk):
         self.health_bar.update_health(level, why)
         self.pages["main"].light.update_health(level, why)
         self.pages["measure"].light.update_health(level, why)
+        self.pages["scan"].light.update_health(level, why)
+
+    def stop_scan_for_shutdown(self, what):
+        """Get the threshold back before the port goes away. True to go on.
+
+        Closing the window or pressing Disconnect mid-scan would leave
+        the ASIC at whatever threshold the sweep had reached - most
+        likely the bottom of it, inside the noise - and the next session
+        would inherit that with nothing on screen to say so. There is no
+        time to confirm the write here, so the operator is told that.
+        """
+        scan = self.pages["scan"]
+        if not scan.running:
+            return True
+        if not messagebox.askyesno(
+                "Scan running",
+                f"A threshold scan is running.\n\n{what} now sends the "
+                "threshold back to where the scan found it, but there is "
+                "no time to confirm it landed. Check with 'ch N dump' "
+                "afterwards.\n\nContinue?"):
+            return False
+        target = scan.dac1_at_start       # blind_restore clears the state
+        if scan.blind_restore():
+            self.toast("threshold sent back to dac1=%s, NOT confirmed"
+                       % target, ms=15000)
+        return True
 
     def on_close(self):
+        if not self.stop_scan_for_shutdown("Closing"):
+            return
         self.link.close()
         self.destroy()
 
