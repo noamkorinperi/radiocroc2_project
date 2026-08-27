@@ -16,6 +16,11 @@
  * COMMAND SET
  *   help                       list commands
  *   stat                       print counters and health flags
+ *   lines                      static level of every ASIC control line,
+ *                              then watch NOR_T1OC for 200 ms. Answers
+ *                              the one question the counters cannot:
+ *                              whether the trigger line moves at all,
+ *                              and in which direction. See cmd_lines().
  *   fmt bin|txt                event stream format
  *
  *   ch <n|all> indac <0-255>           SiPM overvoltage trim
@@ -50,11 +55,12 @@
  *                                      lines. See rr2_i2ctest.h.
  *
  * ONE GAIN IS READ OUT
- * The ADC only sees OUT_AMUXLG, so it is the lg half of gain / tau /
- * slow that shapes the spectrum. The hg half is OPTIONAL: leave the
- * argument off and the HG chain keeps exactly what it already had.
- * It stays settable from here because it feeds the charge trigger, but
- * nothing digitises it and the GUI no longer offers it.
+ * OUT_AMUXHG reaches PA4 / ADC1_IN4, but the firmware digitises only
+ * OUT_AMUXLG, so it is the lg half of gain / tau / slow that shapes the
+ * spectrum. The hg half is OPTIONAL: leave the argument off and the HG
+ * chain keeps exactly what it already had. It stays settable from here
+ * because it feeds the charge trigger, but nothing reads it and the GUI
+ * no longer offers it.
  ******************************************************************************
  */
 #ifndef USB_CMD_H

@@ -65,7 +65,7 @@ void RR2_Ctrl_ResetShadow(void)
     sh.com_slope     = RR2_BIAS_NIBBLE_DEFAULT;    /* 0x44 */
     sh.com_hyst_trig = RR2_COM_HYST_TRIG_DEFAULT;  /* 0xE4 */
 
-    sh.out_power     = RR2_OUT_POWER_DEFAULT;      /* 0x0B */
+    sh.out_power     = RR2_OUT_POWER_DEFAULT;      /* 0x09 */
     sh.bias_on1      = RR2_BIAS_ON1_DEFAULT;       /* 0xFF */
     sh.bias_on2      = RR2_BIAS_ON2_DEFAULT;       /* 0xFF */
 }
@@ -364,14 +364,37 @@ RR2_Status RR2_Ctrl_SetAnalogMux(uint8_t enable)
 {
     uint8_t b = sh.out_power;
 
-    /* HG is cleared unconditionally: OUT_AMUXHG is not connected to an
-       ADC, so powering its buffer only burns current into a dead pad. */
-    b &= (uint8_t)~((1u << RR2_EN_AMUXHG_Pos) | (1u << RR2_EN_AMUXLG_Pos));
+    /* Only the LG enable is touched. This used to clear EN_aMuxHG on
+       the way past, which was fine while nothing read HG - but now that
+       'hg' is a runtime switch, keeping that habit would let 'mux 1'
+       (and 'preset csi', which ends in it) silently unpower a buffer
+       the DAQ is still appending codes from. Each gain path owns its
+       own bit.                                                        */
+    b &= (uint8_t)~(1u << RR2_EN_AMUXLG_Pos);
 
     if (enable) {
         b |= (uint8_t)(1u << RR2_EN_AMUXLG_Pos);
         /* The buffer supply the mux output shares. */
         b |= (uint8_t)(1u << RR2_ON_ABUFFER_Pos);
+    }
+
+    sh.out_power = b;
+    return RR2_Write(RR2_ADDR_OUTING, RR2_OUT_SUB_POWER, sh.out_power);
+}
+
+RR2_Status RR2_Ctrl_SetAnalogMuxHG(uint8_t enable)
+{
+    uint8_t b = sh.out_power;
+
+    if (enable) {
+        b |= (uint8_t)(1u << RR2_EN_AMUXHG_Pos);
+        /* Same shared buffer supply the LG path switches on. */
+        b |= (uint8_t)(1u << RR2_ON_ABUFFER_Pos);
+    } else {
+        /* Drop only the HG enable. ON_aBuffer stays up because the LG
+           mux output rides on it too - turning HG off must not take
+           the working gain path down with it.                         */
+        b &= (uint8_t)~(1u << RR2_EN_AMUXHG_Pos);
     }
 
     sh.out_power = b;

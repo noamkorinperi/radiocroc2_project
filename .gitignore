@@ -28,6 +28,11 @@ venv/
 # repository of firmware is not it.
 /python/measurements/
 
+# Threshold scans, for the same reason. The CSV is already covered by
+# the *.csv rule above; this catches the JSON record beside it, which
+# would otherwise turn up in git status after every sweep.
+/python/scans/
+
 # The handful of choices the GUI remembers between runs.
 /python/gui_prefs.json
 

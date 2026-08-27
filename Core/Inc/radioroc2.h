@@ -15,7 +15,7 @@
  *        R1 <- address       (MSB: 0-63 = channel, 64-67 = global blocks)
  *        R2 <- data          (commits the write)
  *
- * REQUIREMENT: clk_sm_i2c (PE9 / TIM1_CH1) must run at EXACTLY 20 x SCL
+ * REQUIREMENT: clk_sm_i2c (PA8 / TIM1_CH1) must run at EXACTLY 20 x SCL
  * and be synchronous with it. With SCL = 100 kHz -> clk_sm_i2c = 2 MHz.
  * Start that PWM before calling any function here.
  ******************************************************************************

@@ -32,7 +32,6 @@
 #include "usb_stream.h"      /* event streaming over the ST-Link VCP */
 #include "radioroc2_ctrl.h"  /* shadow registers + setters */
 #include "usb_cmd.h"         /* host command interface */
-#include "rr2_test_clocks.h" /* scope test 1: CLK_SM_I2C + CK_READ */
 #include "rr2_test_i2c.h"    /* scope test 2: Slow Control I2C bus */
 #include <stdio.h>           /* optional: printf over SWO/VCP */
 /* USER CODE END Includes */
@@ -220,12 +219,35 @@ int main(void)
      *   2) Only then release the resets.
      *   3) Only then talk to the chip.
      * ------------------------------------------------------------- */
+    /* Deafen the trigger until the ASIC is configured.
+     *
+     * MX_GPIO_Init() arms EXTI0 about a second before the chip is in a
+     * state worth listening to. For that second all 64 channels are
+     * enabled - 60 of them on floating inputs - and RR2_Ctrl_PushAll()
+     * is busy writing a shadow whose threshold DACs are still 0x00,
+     * which is the very bottom of the 256..534 mV range. Every
+     * discriminator fires on everything, and the counter reaches the
+     * hundreds before the run has begun.
+     *
+     * Those counts are not harmless. trigger_count is what a rate
+     * measurement is read from, and starting it at some arbitrary
+     * boot-dependent offset makes the first reading of a quiet
+     * detector indistinguishable from a working one. The single event
+     * serviced immediately afterwards is worse: it is a real frame,
+     * with a sequence number and a timestamp, carrying peak detector
+     * codes from a chip that was still being configured while they
+     * were captured. */
+    HAL_NVIC_DisableIRQ(NOR_T1OC_EXTI_IRQn);
+
     RR2_StartClocks();                    /* CLK_SM_I2C = 2 MHz           */
     RR2_HW_ReleaseResets();               /* de-assert active-low resets  */
     RR2_Init(&hi2c1);                     /* bind the Slow Control driver */
-    /* Only OUT_AMUXLG is instrumented, on PA5 / ADC2_IN5. ADC1 (PA4) is
-       still brought up by CubeMX above, but nothing reads it. */
-    RR2_DAQ_Init(&hadc2);                 /* bind the ADC, enable DWT     */
+    /* Both gains reach an ADC since the rewire - OUT_AMUXLG on PA5 /
+       ADC2_IN5, OUT_AMUXHG on PA4 / ADC1_IN4. Both handles are bound,
+       but HG stays dormant until the host sends 'hg 1': the switch
+       lives in the DAQ and the OUT_POWER shadow, not in which handles
+       this call was given. */
+    RR2_DAQ_Init(&hadc2, &hadc1);         /* bind the ADCs, enable DWT    */
     g_rr2_timing_ok = RR2_DAQ_IsTimingOk();
 
     /* Temperature sensor lives on its own bus, independent of the ASIC. */
@@ -236,16 +258,7 @@ int main(void)
      * answered, otherwise a later 'push' from the host would write
      * zeros everywhere. */
     RR2_Ctrl_ResetShadow();
-    /* Scan all 16 possible chip IDs to find which one ACKs. */
-    volatile uint8_t found_id = 0xFF;
-    for (uint8_t id = 0; id < 16; id++) {
-        uint8_t addr = (uint8_t)(((id << 3) | 0) << 1);   /* R0 of that chip id */
-        if (HAL_I2C_IsDeviceReady(&hi2c1, addr, 3, 100) == HAL_OK) {
-            found_id = id;
-            break;
-        }
-    }
-    /* breakpoint here, read found_id */
+
     /* Free the bus before the first transaction. A reset that landed
        inside a Slow Control frame leaves the ASIC holding SDA low, and
        every write from here would fail until someone pulled power. */
@@ -268,6 +281,19 @@ int main(void)
         RR2_DAQ_EndOfReadout();
     }
 
+    /* Now the trigger means something. Re-armed outside the branch
+       above so an ASIC that never answered still ends up in a defined
+       state rather than permanently deaf. The pending bit is cleared
+       as well as the flag: the edges that arrived while the interrupt
+       was masked are latched in the EXTI, and enabling the IRQ without
+       dropping them would deliver the whole boot burst as one trigger
+       the moment the main loop starts. */
+    g_rr2_trigger_flag  = 0u;
+    g_rr2_trigger_count = 0u;
+    __HAL_GPIO_EXTI_CLEAR_IT(NOR_T1OC_Pin);
+    HAL_NVIC_ClearPendingIRQ(NOR_T1OC_EXTI_IRQn);
+    HAL_NVIC_EnableIRQ(NOR_T1OC_EXTI_IRQn);
+
     /* Start the host link. Binary framing by default; switch to
      * USBSTREAM_FMT_TEXT if you want to watch it in a serial terminal. */
     USBStream_Init();
@@ -288,12 +314,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
     while (1)
       {
-        /* --- Scope tests, driven from the debugger -------------------- */
-        /* Both are no-ops until their mode variable is set from Live
-           Expressions, and both block until it is cleared again. Keep
-           them ahead of the DAQ so nothing else drives the lines while
-           a probe is on them. See rr2_test_clocks.h / rr2_test_i2c.h. */
-        RR2_TestClocks_Task();
+        /* --- Scope test, driven from the debugger --------------------- */
+        /* A no-op until its mode variable is set from Live Expressions,
+           and it blocks until that is cleared again. Kept ahead of the
+           DAQ so nothing else drives the bus while a probe is on it.
+           See rr2_test_i2c.h. */
         RR2_TestI2C_Task();
 
         /* --- Slow Control error reported by the ASIC ------------------ */
@@ -386,7 +411,7 @@ void SystemClock_Config(void)
 /**
  * @brief Start the clock the ASIC's I2C slave core needs.
  *
- * CLK_SM_I2C (PE9 / TIM1_CH1) MUST run at exactly 20x the SCL
+ * CLK_SM_I2C (PA8 / TIM1_CH1) MUST run at exactly 20x the SCL
  * frequency: 100 kHz SCL -> 2 MHz here.
  *
  * CK_READ is deliberately NOT started here. It is burst generated in

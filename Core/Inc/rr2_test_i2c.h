@@ -8,7 +8,7 @@
  * (everything just NACKs) and are trivial to tell apart on a scope:
  *
  *   1. Is SCL the frequency we think it is?
- *      The ASIC requires clk_sm_i2c = 20 x SCL. PE9 runs at exactly
+ *      The ASIC requires clk_sm_i2c = 20 x SCL. PA8 runs at exactly
  *      2.000 MHz, so SCL must be 100 kHz. But the CubeMX timing word
  *      0x20404768 gives tSCLH = 4.00 us and tSCLL = 5.83 us, i.e. about
  *      101.7 kHz nominal - a ratio of 19.7, just UNDER the required 20.
@@ -28,10 +28,10 @@
  * PROBE SETUP
  *   CH1 -> PB8  (SCL)
  *   CH2 -> PB9  (SDA)
- *   CH3 -> PE9  (CLK_SM_I2C), if you have a third channel
+ *   CH3 -> PA8  (CLK_SM_I2C), if you have a third channel
  *
  * With CH3 connected you can read the 20:1 ratio directly off the
- * screen: count PE9 edges inside one SCL period. That measurement is
+ * screen: count PA8 edges inside one SCL period. That measurement is
  * the whole point of this test.
  *
  * Trigger on CH2 falling edge (START condition, SDA falling while SCL

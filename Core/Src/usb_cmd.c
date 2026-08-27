@@ -10,9 +10,28 @@
 #include "radioroc2_daq.h"
 #include "rr2_i2ctest.h"
 #include "usb_stream.h"
+#include "main.h"            /* the pin macros, for the line report */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+/* ------------------------------------------------------------------ */
+/* Bring-up state owned by main.c                                      */
+/* ------------------------------------------------------------------ */
+/* These live in main.c and have no header of their own. They are read
+   here so 'stat' can answer the question a stalled bring-up actually
+   raises - did the ASIC ever get configured, and is the trigger line
+   moving - without a debugger attached. Declared locally rather than
+   in main.h, which is CubeMX generated and does not know RR2_Status. */
+extern volatile uint8_t    g_rr2_online;
+extern volatile uint8_t    g_rr2_bus_jam;
+extern volatile uint8_t    g_rr2_timing_ok;
+extern volatile uint8_t    g_rr2_sc_error;
+extern volatile RR2_Status g_rr2_cfg_status;
+extern volatile RR2_Status g_rr2_read_status;
+extern volatile uint32_t   g_rr2_trigger_count;
+extern volatile uint32_t   g_rr2_events_ok;
+extern volatile uint32_t   g_rr2_events_bad;
 
 /* ------------------------------------------------------------------ */
 /* Receive ring - written from the USB ISR, drained from the main loop */
@@ -104,7 +123,7 @@ static uint8_t parse_channel(uint8_t index, uint8_t *ok)
 static void cmd_help(void)
 {
     reply("commands:\r\n");
-    reply("  stat | fmt bin|txt | defaults | push\r\n");
+    reply("  stat | lines | fmt bin|txt | defaults | push\r\n");
     reply("  ch <n|all> indac <0-255>\r\n");
     reply("  ch <n|all> gain <lg> [hg]      (0-15)\r\n");
     reply("  ch <n|all> tau <lg> [hg]       (0-15)\r\n");
@@ -118,6 +137,7 @@ static void cmd_help(void)
     reply("  th <dac1> <dac2> <dacq>        (0-1023)\r\n");
     reply("  delay <0-255> <slope 0-15>\r\n");
     reply("  trig <0-15> | hold int|ext | mux <0|1>  (LG buffer)\r\n");
+    reply("  hg <0|1>                       HG buffer + HG readout\r\n");
     reply("  preset csi\r\n");
     reply("  w <addr> <sub> <data> | r <addr> <sub>\r\n");
     reply("  i2ctest                        Slow Control link test\r\n");
@@ -140,12 +160,97 @@ static void cmd_dump(uint8_t ch)
                    s->ch[ch][4], s->ch[ch][5], s->ch[ch][6], s->ch[ch][7]);
     reply(b);
 
+    /* mux shows what the ASIC was asked to power (the OUT_POWER shadow,
+       EN_aMuxHG is bit 1), hg shows what the DAQ actually samples. They
+       normally agree; a failed Slow Control write is the case where
+       they will not, and this line is where that shows. */
     (void)snprintf(b, sizeof(b),
-                   "glob: dac %02X %02X %02X %02X  dly %02X %02X  trig %02X  mux %02X\r\n",
+                   "glob: dac %02X %02X %02X %02X  dly %02X %02X  trig %02X  mux %02X  hg %u\r\n",
                    s->com_dac1_lo, s->com_dac2_dac1, s->com_dacq_dac2,
                    s->com_dacq_hi, s->com_delay, s->com_slope,
-                   s->com_hyst_trig, s->out_power);
+                   s->com_hyst_trig, s->out_power, (unsigned)RR2_DAQ_GetHG());
     reply(b);
+}
+
+/**
+ * @brief Report the static level of every ASIC control line, then watch
+ *        the trigger line for a fixed window.
+ *
+ * This exists because "no events" has two causes that look identical
+ * from the counters: an ASIC that never fires, and an EXTI armed on the
+ * edge the line does not produce. Both leave trigger_count at zero.
+ *
+ * NOR_T1OC is assumed active low everywhere in this firmware - EXTI0 is
+ * armed on the falling edge and PA0 carries a pull-up. If the open
+ * collector driver in the ASIC conducts while idle, the line sits LOW
+ * between events and rises on a trigger, and every one of them is
+ * invisible. nor= below is that answer: 1 means the assumption holds,
+ * 0 means the interrupt is watching the wrong direction.
+ *
+ * The two counters are complementary and neither is redundant. The
+ * polled ones only see a pulse wider than the sampling loop, which at
+ * -O0 is a few hundred ns; exti= is incremented from the interrupt and
+ * catches pulses far shorter than that, but only in one direction.
+ * Polled edges with no exti= movement is the wrong-edge signature.
+ *
+ * Blocks the main loop for the length of the window. Triggers arriving
+ * meanwhile still latch their flag and are serviced afterwards.
+ */
+static void cmd_lines(void)
+{
+    const uint32_t window_ms = 200u;
+    uint32_t rise = 0u, fall = 0u, low = 0u, samples = 0u;
+
+    /* One key=value per line, exactly as 'stat' answers. The GUI only
+       recognises a reply as data when the line holds a single pair and
+       no spaces, so packing several onto a line would print in the
+       console and reach nothing that saves it. */
+    reply_kv("nor",       (int32_t)HAL_GPIO_ReadPin(NOR_T1OC_GPIO_Port,  NOR_T1OC_Pin));
+    reply_kv("errorn",    (int32_t)HAL_GPIO_ReadPin(ERRORN_SC_GPIO_Port, ERRORN_SC_Pin));
+    reply_kv("reset_n",   (int32_t)HAL_GPIO_ReadPin(RESET_N_GPIO_Port,   RESET_N_Pin));
+    reply_kv("rstn_read", (int32_t)HAL_GPIO_ReadPin(RSTN_READ_GPIO_Port, RSTN_READ_Pin));
+    reply_kv("rstn_i2c",  (int32_t)HAL_GPIO_ReadPin(RSTN_I2C_GPIO_Port,  RSTN_I2C_Pin));
+    reply_kv("rstn_sc",   (int32_t)HAL_GPIO_ReadPin(RSTN_SC_GPIO_Port,   RSTN_SC_Pin));
+    reply_kv("holdext",   (int32_t)HAL_GPIO_ReadPin(HOLDEXT_GPIO_Port,   HOLDEXT_Pin));
+    reply_kv("ck_read",   (int32_t)HAL_GPIO_ReadPin(CK_READ_GPIO_Port,   CK_READ_Pin));
+
+    /* Watch NOR_T1OC. */
+    {
+        const uint32_t exti_before = g_rr2_trigger_count;
+        const uint32_t t_start = HAL_GetTick();   /* difference form: wrap safe */
+        uint8_t prev = (uint8_t)HAL_GPIO_ReadPin(NOR_T1OC_GPIO_Port, NOR_T1OC_Pin);
+
+        while ((HAL_GetTick() - t_start) < window_ms) {
+            const uint8_t now =
+                (uint8_t)HAL_GPIO_ReadPin(NOR_T1OC_GPIO_Port, NOR_T1OC_Pin);
+            if (now != prev) {
+                if (now) rise++; else fall++;
+                prev = now;
+            }
+            if (!now) low++;
+            samples++;
+        }
+
+        reply_kv("nor_ms",   (int32_t)window_ms);
+        reply_kv("nor_rise", (int32_t)rise);
+        reply_kv("nor_fall", (int32_t)fall);
+        reply_kv("nor_exti", (int32_t)(g_rr2_trigger_count - exti_before));
+    }
+
+    /* Permille rather than percent: a source at a few hundred counts a
+       second holds the line down for well under 1% of the window, and
+       percent would round every one of those to a flat zero.
+
+       Divided down first rather than scaling low by 1000. The loop is
+       untimed and its sample count depends on the optimisation level -
+       at -O2 it can pass ten million, and ten million times a thousand
+       does not fit in the 32 bits this arithmetic runs in. */
+    {
+        const uint32_t per_permille = (samples + 999u) / 1000u;
+        reply_kv("nor_low_permille",
+                 (per_permille != 0u) ? (int32_t)(low / per_permille) : 0);
+        reply_kv("nor_samples", (int32_t)samples);
+    }
 }
 
 static void cmd_ch(void)
@@ -203,6 +308,33 @@ static void execute(void)
         cmd_help();
     }
     else if (arg_is(0u, "stat")) {
+        /* Bring-up first. All of this already rides in the status frame,
+           but that frame is binary by default, so on a terminal it is
+           the noise you scroll past - and the one number that splits
+           "the ASIC never triggered" from "the readout failed" was
+           only ever legible to a debugger. online=0 in particular is
+           worth reading before anything else: main() skips the whole
+           configuration sequence when the chip does not ACK, and then
+           streams nothing while every other indicator stays green. */
+        reply_kv("online",    (int32_t)g_rr2_online);
+        reply_kv("cfg_st",    (int32_t)g_rr2_cfg_status);
+        reply_kv("bus_jam",   (int32_t)g_rr2_bus_jam);
+        reply_kv("sc_error",  (int32_t)g_rr2_sc_error);
+        reply_kv("timing_ok", (int32_t)g_rr2_timing_ok);
+        reply_kv("triggers",  (int32_t)g_rr2_trigger_count);
+        reply_kv("events_ok", (int32_t)g_rr2_events_ok);
+        reply_kv("events_bad",(int32_t)g_rr2_events_bad);
+        reply_kv("read_st",   (int32_t)g_rr2_read_status);
+        /* Which of the three Slow Control frames a failed write died
+           on, as an RR2_Status: 1 = R0 sub-address, 2 = R1 address,
+           3 = R2 data. "ERR: ASIC write failed" says only that one of
+           them NACKed, and the three mean different faults - a chip
+           that never saw the frame at all, against one that took the
+           address and refused the payload. Kept next to the counts so
+           a failure and the command it belongs to are read together. */
+        reply_kv("cmd_last",   (int32_t)cmd_last);
+        reply_kv("cmd_done",   (int32_t)cmd_done);
+        reply_kv("cmd_failed", (int32_t)cmd_failed);
         reply_kv("pending", (int32_t)USBStream_GetPending());
         reply_kv("dropped", (int32_t)USBStream_GetDropped());
         reply_kv("rx_overruns", (int32_t)overruns);
@@ -220,6 +352,9 @@ static void execute(void)
             USBStream_SetFormat(USBSTREAM_FMT_BINARY);
             reply("ok, binary\r\n");
         }
+    }
+    else if (arg_is(0u, "lines")) {
+        cmd_lines();
     }
     else if (arg_is(0u, "ch")) {
         cmd_ch();
@@ -241,6 +376,20 @@ static void execute(void)
     }
     else if (arg_is(0u, "mux")) {
         reply_status(RR2_Ctrl_SetAnalogMux((uint8_t)arg_i(1u, 1)));
+    }
+    else if (arg_is(0u, "hg")) {
+        /* Two halves that must move together: EN_aMuxHG powers the mux
+           buffer inside the ASIC, the DAQ switch makes the readout
+           digitise PA4 and the stream append the codes. The DAQ goes
+           first because it is the only half that can refuse locally
+           (no ADC1 bound). If the Slow Control write then fails, the
+           shadow still holds the intent and the next 'push' applies
+           it - the same recovery every other setter here relies on -
+           and 'glob' shows the two halves disagreeing meanwhile. */
+        const uint8_t on = (uint8_t)(arg_i(1u, 1) != 0);
+        RR2_Status st = RR2_DAQ_SetHG(on);
+        if (st == RR2_OK) st = RR2_Ctrl_SetAnalogMuxHG(on);
+        reply_status(st);
     }
     else if (arg_is(0u, "preset")) {
         if (arg_is(1u, "csi")) {

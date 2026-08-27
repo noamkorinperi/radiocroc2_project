@@ -18,13 +18,18 @@
  *
  * IMPORTANT - CK_READ must be BURST generated, not free-running.
  * A continuously running PWM on CK_READ would keep shifting the read
- * pointer between events, so PA1 is driven as GPIO_Output and pulsed
+ * pointer between events, so PA2 is driven as GPIO_Output and pulsed
  * in software.
  *
- * ONE GAIN - only OUT_AMUXLG is instrumented on this board. It lands on
- * PA5 / ADC2_IN5; OUT_AMUXHG is not wired anywhere, and its mux buffer
- * is powered down in Slow Control (EN_aMuxHG = 0). So an event carries
- * exactly one code per channel, all the way out to the host.
+ * TWO GAINS, ONE SWITCH - both mux outputs are wired to an ADC:
+ * OUT_AMUXLG on PA5 / ADC2_IN5 and OUT_AMUXHG on PA4 / ADC1_IN4. LG is
+ * always digitised; HG is opt-in at runtime through the 'hg' host
+ * command, which powers the HG mux buffer in Slow Control AND flips
+ * this driver into sampling both pins per channel. The default stays
+ * LG-only, so a host that never asks sees exactly the old stream. When
+ * HG is on, the two conversions run in parallel on their separate
+ * ADCs - see RR2_DAQ_SamplePair() - and the event grows by an appended
+ * HG block on the wire, not a new frame type (usb_stream.h).
  ******************************************************************************
  */
 #ifndef RADIOROC2_DAQ_H
@@ -34,6 +39,14 @@
 
 /* ------------------------------------------------------------------ */
 /* Timing constants (ns). Derived from the datasheet, tune on hardware. */
+/*                                                                      */
+/* REQUESTED, NOT DELIVERED. Measured on the bench 2026-08-26: at -O0   */
+/* one HAL_GPIO_WritePin costs ~245 ns, which swamps the 100 ns below,  */
+/* so CK_READ really runs at ~732 kHz - a 1365 ns period, roughly 680   */
+/* ns per half. That is safe: every constraint here is a MINIMUM and a  */
+/* longer pulse only costs dead time. It is not the bottleneck either:  */
+/* the four-channel window clocks out in ~5.5 us against ~24 us of ADC  */
+/* conversions in the same event.                                       */
 /* ------------------------------------------------------------------ */
 #define RR2_CKREAD_HIGH_NS      100u   /* CK_READ high time            */
 #define RR2_CKREAD_LOW_NS       100u   /* CK_READ low time             */
@@ -59,8 +72,10 @@
 /* ------------------------------------------------------------------ */
 typedef struct {
     uint16_t lg[RR2_NUM_CHANNELS];  /* OUT_AMUXLG peak, ADC2_IN5 counts */
-    uint8_t  first_ch;              /* first channel stored in lg      */
+    uint16_t hg[RR2_NUM_CHANNELS];  /* OUT_AMUXHG peak, ADC1_IN4 counts */
+    uint8_t  first_ch;              /* first channel stored in lg/hg   */
     uint8_t  count;                 /* how many channels are valid     */
+    uint8_t  has_hg;                /* 1 when hg[] was digitised too   */
     uint32_t seq;                   /* trigger sequence number         */
 } RR2_Event;
 
@@ -68,9 +83,21 @@ typedef struct {
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 
-/** Bind the ADC and enable the DWT cycle counter used for ns delays.
- *  Call once after MX_ADC2_Init().                                    */
-void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg);
+/** Bind the ADCs and enable the DWT cycle counter used for ns delays.
+ *  Call once after the MX_ADCx_Init() calls. adc_hg may be NULL: the
+ *  HG switch then refuses to turn on and everything else behaves
+ *  exactly as the LG-only build did.                                  */
+void RR2_DAQ_Init(ADC_HandleTypeDef *adc_lg, ADC_HandleTypeDef *adc_hg);
+
+/** Digitise OUT_AMUXHG alongside OUT_AMUXLG on every event (1), or go
+ *  back to LG only (0). Refuses to enable when no HG ADC was bound at
+ *  init - accepting would stream events whose HG block never converted.
+ *  This is the DAQ half of the 'hg' command; the ASIC half, powering
+ *  the HG mux buffer, is RR2_Ctrl_SetAnalogMuxHG().                   */
+RR2_Status RR2_DAQ_SetHG(uint8_t on);
+
+/** Current state of the HG readout switch.                            */
+uint8_t RR2_DAQ_GetHG(void);
 
 /** 1 if the DWT cycle counter is running and delays are cycle-accurate,
  *  0 if the driver fell back to a coarse software loop. Check this once
@@ -109,5 +136,10 @@ RR2_Status RR2_DAQ_ReadWindow(RR2_Event *evt, uint8_t first_ch, uint8_t count);
 /** Sample OUT_AMUXLG once, without touching CK_READ. Useful to probe
  *  a single channel or to check the analog path during bring-up.      */
 RR2_Status RR2_DAQ_SampleLG(uint16_t *lg);
+
+/** Sample OUT_AMUXLG and OUT_AMUXHG once, without touching CK_READ.
+ *  The two conversions overlap - LG on ADC2, HG on ADC1 - so a pair
+ *  costs the same wall time as one gain alone.                        */
+RR2_Status RR2_DAQ_SamplePair(uint16_t *lg, uint16_t *hg);
 
 #endif /* RADIOROC2_DAQ_H */

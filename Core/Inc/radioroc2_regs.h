@@ -286,10 +286,11 @@ static inline RR2_Status RR2_SetTimeThresholds(uint16_t dac1, uint16_t dac2, uin
 #define RR2_ON_OUTING_Pos      4u
 #define RR2_ON_ABUFFER_Pos     3u
 #define RR2_EN_PROBE_Pos       2u
-#define RR2_EN_AMUXHG_Pos      1u   /* HG analog-mux buffer - OUT_AMUXHG is not wired */
+#define RR2_EN_AMUXHG_Pos      1u   /* HG analog-mux buffer - PA4 / ADC1_IN4 */
 #define RR2_EN_AMUXLG_Pos      0u   /* enable LG analog-mux buffer (needed for ADC read) */
-/* Only OUT_AMUXLG reaches an ADC on this board, so the HG mux buffer is
-   left unpowered: it would drive a pad nobody listens to.            */
+/* Both mux outputs reach an ADC. LG is always read; HG is opt-in at
+   runtime through the 'hg' host command, so the default keeps its
+   buffer unpowered and a host that never asks sees no change at all. */
 #define RR2_OUT_POWER_DEFAULT  0x09u /* ON_aBuffer=1, EN_aMuxHG=0, EN_aMuxLG=1 */
 
 

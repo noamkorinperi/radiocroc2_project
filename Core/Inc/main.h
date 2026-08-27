@@ -60,10 +60,14 @@ void Error_Handler(void);
 #define NOR_T1OC_Pin GPIO_PIN_0
 #define NOR_T1OC_GPIO_Port GPIOA
 #define NOR_T1OC_EXTI_IRQn EXTI0_IRQn
-#define CK_READ_Pin GPIO_PIN_1
+#define CK_READ_Pin GPIO_PIN_2
 #define CK_READ_GPIO_Port GPIOA
-#define CLK_SM_I2C_Pin GPIO_PIN_9
-#define CLK_SM_I2C_GPIO_Port GPIOE
+#define OUT_HG_Pin GPIO_PIN_4
+#define OUT_HG_GPIO_Port GPIOA
+#define OUT_LG_Pin GPIO_PIN_5
+#define OUT_LG_GPIO_Port GPIOA
+#define CLK_SM_I2C_Pin GPIO_PIN_8
+#define CLK_SM_I2C_GPIO_Port GPIOA
 #define RSTN_I2C_Pin GPIO_PIN_0
 #define RSTN_I2C_GPIO_Port GPIOD
 #define RSTN_READ_Pin GPIO_PIN_1

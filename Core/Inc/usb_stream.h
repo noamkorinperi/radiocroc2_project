@@ -6,9 +6,12 @@
  * Two output formats share one transmit path:
  *
  *   BINARY (default) - framed, compact, CRC protected. A full 64-channel
- *                      event is 149 bytes, and 921600 baud 8N1 carries
- *                      about 92 kB/s, so the link sustains roughly 610
- *                      full events per second before frames drop.
+ *                      LG-only event is 149 bytes, and 921600 baud 8N1
+ *                      carries about 92 kB/s, so the link sustains
+ *                      roughly 610 full events per second before frames
+ *                      drop. With the HG readout on ('hg 1') the frame
+ *                      grows to 277 bytes and that ceiling falls to
+ *                      roughly 330.
  *   TEXT             - human readable CSV, for bring-up only. The same
  *                      event is roughly 0.4 kB, so it only keeps up at
  *                      low rates. Handy with any serial terminal.
@@ -29,9 +32,16 @@
  *   12  1   first channel
  *   13  1   channel count
  *   14  2*count  OUT_AMUXLG ADC codes, one per channel
+ *   then, only while the HG readout is on ('hg 1'):
+ *   ..  2*count  OUT_AMUXHG ADC codes, same channel order
  *
- * One code per channel, not two: the board digitises only OUT_AMUXLG.
- * See radioroc2_daq.h.
+ * There is no flag byte for the HG block - the length is the flag. The
+ * host tests plen >= 14 + 4*count; anything shorter is an LG-only
+ * event, from this firmware or any before it. Same append-only trick
+ * the status payload plays with its command counters at offset 27
+ * (below), and for the same reason: a host that only knows the shorter
+ * layout still decodes every field it expects.
+ * See radioroc2_daq.h for how the switch works.
  *
  * Status payload:
  *   0   4   uptime, ms since boot
@@ -69,7 +79,8 @@
 #include "radioroc2_daq.h"
 #include <stdint.h>
 
-/* Ring size. 8 KB holds roughly 55 full events of burst. */
+/* Ring size. 8 KB holds roughly 55 LG-only events of burst, or 29
+   once the HG block doubles the per-event payload. */
 #ifndef USBSTREAM_RING_SIZE
 #define USBSTREAM_RING_SIZE     8192u
 #endif

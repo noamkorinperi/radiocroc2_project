@@ -205,12 +205,28 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
             if (!text_push(","))                          { frames_dropped++; return 0u; }
             if (!text_push_i32((int32_t)evt->lg[ch]))     { frames_dropped++; return 0u; }
         }
+        /* HG columns after ALL the LG ones, never interleaved - the
+           text row mirrors the binary payload, so a reader that takes
+           the first 'count' values after the header still gets pure LG
+           whether or not the event carries the second gain. */
+        if (evt->has_hg) {
+            for (uint8_t i = 0u; i < count; ++i) {
+                const uint8_t ch = (uint8_t)(first + i);
+                if (!text_push(","))                      { frames_dropped++; return 0u; }
+                if (!text_push_i32((int32_t)evt->hg[ch])) { frames_dropped++; return 0u; }
+            }
+        }
         if (!text_push("\r\n")) { frames_dropped++; return 0u; }
         return 1u;
     }
 
     /* ---- Binary ---- */
-    const uint16_t payload_len = (uint16_t)(14u + (2u * (uint32_t)count));
+    /* The HG block is announced by nothing but the payload length: the
+       host tests plen against 14 + 4*count. Appended after the LG
+       codes, not interleaved and not a new frame type, so a decoder
+       that predates it keeps working untouched. */
+    const uint16_t payload_len = (uint16_t)(14u + (2u * (uint32_t)count)
+                                     + (evt->has_hg ? (2u * (uint32_t)count) : 0u));
     const uint32_t need        = 2u + 1u + 2u + payload_len + 2u;
 
     if (ring_free() < need) {
@@ -226,6 +242,11 @@ uint8_t USBStream_SendEvent(const RR2_Event *evt,
     put_crc(count);
     for (uint8_t i = 0u; i < count; ++i) {
         put_u16_crc(evt->lg[(uint8_t)(first + i)]);
+    }
+    if (evt->has_hg) {
+        for (uint8_t i = 0u; i < count; ++i) {
+            put_u16_crc(evt->hg[(uint8_t)(first + i)]);
+        }
     }
     put_footer();
     return 1u;
