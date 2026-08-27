@@ -46,7 +46,8 @@ git clone https://github.com/noamkorinperi/radiocroc2_project.git
    *Do not* use the CubeMX project importer — the `.project` and `.cproject`
    here are already complete.
 2. **Project → Build Project** (Ctrl+B). A clean build finishes with
-   **0 errors, 0 warnings** and reports roughly `52356 text, 100 data, 12004 bss`.
+   **0 errors, 0 warnings**. The Debug configuration reports about
+   `52356 text, 100 data, 12004 bss`; Release is smaller.
 3. Connect the board and **Run → Run As → STM32 C/C++ Application**. A ready-made
    debug configuration, `RADIOROC2_Firmware Debug`, is committed alongside.
 

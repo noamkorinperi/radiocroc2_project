@@ -42,7 +42,8 @@ git clone https://github.com/noamkorinperi/radiocroc2_project.git
    שם הפרויקט ב־Eclipse הוא `RADIOROC2_Firmware` ללא תלות בשם שנתת לתיקייה.
    **אל** תשתמש במייבא של CubeMX — קבצי ה־`.project` וה־`.cproject` כאן כבר שלמים.
 2. **Project → Build Project** (Ctrl+B). בנייה נקייה מסתיימת עם
-   **0 שגיאות, 0 אזהרות** ומדווחת בערך `52356 text, 100 data, 12004 bss`.
+   **0 שגיאות, 0 אזהרות**. תצורת Debug מדווחת בערך
+   `52356 text, 100 data, 12004 bss`; תצורת Release קטנה יותר.
 3. חבר את הלוח ובחר **Run → Run As → STM32 C/C++ Application**. תצורת דיבאג
    מוכנה בשם `RADIOROC2_Firmware Debug` נמצאת בריפוזיטורי לצד הפרויקט.
 
